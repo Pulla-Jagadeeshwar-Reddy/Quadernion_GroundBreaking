@@ -1,0 +1,57 @@
+name: Unity project checks
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate-project:
+    name: validate-project
+    runs-on: windows-latest
+    steps:
+      - name: Check out project
+        uses: actions/checkout@v7
+
+      - name: Check Unity metadata and ignored folders
+        shell: pwsh
+        run: |
+          $tracked = @(git ls-files)
+          $forbiddenPattern = '^(Library|Temp|Obj|Logs|UserSettings|Build|Builds)/|^\.plastic/'
+          $forbidden = @($tracked | Where-Object { $_ -match $forbiddenPattern })
+          if ($forbidden.Count -gt 0) {
+            Write-Host 'Generated or local workspace files must not be committed:'
+            $forbidden | ForEach-Object { Write-Host " - $_" }
+            exit 1
+          }
+
+          if (-not (Test-Path -LiteralPath 'Assets')) {
+            Write-Error 'Assets folder is missing. The repository root must be the Unity project root.'
+            exit 1
+          }
+          if (-not (Test-Path -LiteralPath 'Assets.meta')) {
+            Write-Error 'Assets.meta is missing. Keep the Unity root metadata file in Git.'
+            exit 1
+          }
+
+          $missingMeta = @()
+          Get-ChildItem -LiteralPath 'Assets' -Force -Recurse | ForEach-Object {
+            if ($_.Name -notlike '*.meta') {
+              $assetPath = $_.FullName
+              if (-not (Test-Path -LiteralPath "$assetPath.meta")) {
+                $missingMeta += $_.FullName.Substring((Get-Location).Path.Length + 1)
+              }
+            }
+          }
+
+          if ($missingMeta.Count -gt 0) {
+            Write-Host 'Unity assets/folders missing matching .meta files:'
+            $missingMeta | ForEach-Object { Write-Host " - $_" }
+            exit 1
+          }
+
+          Write-Host 'Unity metadata and repository hygiene checks passed.'

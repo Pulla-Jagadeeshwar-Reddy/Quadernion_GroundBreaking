@@ -5,8 +5,10 @@ using UnityEngine;
 public class NetworkLockedDoor : NetworkBehaviour
 {
     [Header("Door motion")]
-    [Tooltip("Assign the moving door leaf or a hinge pivot. Do not assign the stationary frame.")]
+    [Tooltip("Assign the moving door leaf. Use Hinge Pivot for a separate hinge point; do not assign the stationary frame.")]
     [SerializeField] private Transform doorLeaf;
+    [Tooltip("Optional external hinge pivot. Use this when the door leaf is inside an imported prefab and cannot be reparented.")]
+    [SerializeField] private Transform hingePivot;
     [Tooltip("Optional colliders that physically block the doorway while closed. Include the matching Online Collision Proxies collider if one exists.")]
     [SerializeField] private Collider[] doorBlockers;
     [SerializeField] private Vector3 openEulerAngles = new(0f, 90f, 0f);
@@ -24,6 +26,10 @@ public class NetworkLockedDoor : NetworkBehaviour
 
     private Quaternion closedRotation;
     private Quaternion openRotation;
+    private Vector3 closedWorldPosition;
+    private Quaternion closedWorldRotation;
+    private Vector3 openWorldPosition;
+    private Quaternion openWorldRotation;
 
     private void Awake()
     {
@@ -33,18 +39,34 @@ public class NetworkLockedDoor : NetworkBehaviour
         closedRotation = doorLeaf.localRotation;
         openRotation = closedRotation * Quaternion.Euler(openEulerAngles);
 
+        if (hingePivot != null)
+        {
+            closedWorldPosition = doorLeaf.position;
+            closedWorldRotation = doorLeaf.rotation;
+            Quaternion worldRotationDelta = hingePivot.rotation * Quaternion.Euler(openEulerAngles) *
+                                            Quaternion.Inverse(hingePivot.rotation);
+            openWorldPosition = hingePivot.position + worldRotationDelta * (closedWorldPosition - hingePivot.position);
+            openWorldRotation = worldRotationDelta * closedWorldRotation;
+        }
+
         if (doorBlockers == null || doorBlockers.Length == 0)
             doorBlockers = doorLeaf.GetComponents<Collider>();
     }
 
     public override void OnNetworkSpawn()
     {
+        if (IsServer)
+            IsOpen.Value = false;
+
         IsOpen.OnValueChanged += OnOpenChanged;
         if (IsOpen.Value)
             SetBlockersEnabled(false);
         else
         {
-            doorLeaf.localRotation = closedRotation;
+            if (hingePivot != null)
+                doorLeaf.SetPositionAndRotation(closedWorldPosition, closedWorldRotation);
+            else
+                doorLeaf.localRotation = closedRotation;
             SetBlockersEnabled(true);
         }
     }
@@ -56,13 +78,31 @@ public class NetworkLockedDoor : NetworkBehaviour
 
     private void Update()
     {
-        Quaternion target = IsOpen.Value ? openRotation : closedRotation;
-        doorLeaf.localRotation = Quaternion.Slerp(doorLeaf.localRotation, target, Time.deltaTime * animationSpeed);
-
-        if (Quaternion.Angle(doorLeaf.localRotation, target) <= 0.1f)
+        if (hingePivot != null)
         {
-            doorLeaf.localRotation = target;
-            SetBlockersEnabled(!IsOpen.Value);
+            Vector3 targetPosition = IsOpen.Value ? openWorldPosition : closedWorldPosition;
+            Quaternion targetRotation = IsOpen.Value ? openWorldRotation : closedWorldRotation;
+            doorLeaf.SetPositionAndRotation(
+                Vector3.Lerp(doorLeaf.position, targetPosition, Time.deltaTime * animationSpeed),
+                Quaternion.Slerp(doorLeaf.rotation, targetRotation, Time.deltaTime * animationSpeed));
+
+            if (Vector3.Distance(doorLeaf.position, targetPosition) <= 0.001f &&
+                Quaternion.Angle(doorLeaf.rotation, targetRotation) <= 0.1f)
+            {
+                doorLeaf.SetPositionAndRotation(targetPosition, targetRotation);
+                SetBlockersEnabled(!IsOpen.Value);
+            }
+        }
+        else
+        {
+            Quaternion target = IsOpen.Value ? openRotation : closedRotation;
+            doorLeaf.localRotation = Quaternion.Slerp(doorLeaf.localRotation, target, Time.deltaTime * animationSpeed);
+
+            if (Quaternion.Angle(doorLeaf.localRotation, target) <= 0.1f)
+            {
+                doorLeaf.localRotation = target;
+                SetBlockersEnabled(!IsOpen.Value);
+            }
         }
     }
 

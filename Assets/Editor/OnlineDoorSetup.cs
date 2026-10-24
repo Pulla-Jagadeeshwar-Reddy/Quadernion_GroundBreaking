@@ -17,7 +17,7 @@ public static class OnlineDoorSetup
         GameObject selected = Selection.activeGameObject;
         if (selected == null)
         {
-            EditorUtility.DisplayDialog("Select a door", "Select the moving door leaf in OnlineFirstFloor first.", "OK");
+            EditorUtility.DisplayDialog("Select a door", "Select the door leaf or its Door_Group object in OnlineFirstFloor first.", "OK");
             return;
         }
 
@@ -30,38 +30,40 @@ public static class OnlineDoorSetup
         }
 
         NetworkLockedDoor door = selected.GetComponent<NetworkLockedDoor>();
-        if (door != null)
-        {
-            EditorUtility.DisplayDialog("Already configured", "The selected object already has a Network Locked Door component.", "OK");
-            return;
-        }
-
         if (!EditorUtility.DisplayDialog("Configure networked door",
-                "This adds a NetworkObject and NetworkLockedDoor to the selected moving door leaf. " +
-                "It sets this as a free-use door for both roles and links its local colliders plus a matching " +
-                "'Collision - <door name>' proxy when found. You can change access rules and the open angle in the Inspector.",
+                "This adds or refreshes the NetworkObject and NetworkLockedDoor on the selected door object. " +
+                "It finds a child named Door.* as the moving leaf, links a matching DoorHinge* pivot and " +
+                "'Collision - <door name>' proxy when present. New doors are free-use for both roles; existing access settings are preserved.",
                 "Configure selected door", "Cancel"))
             return;
 
+        bool isNewDoor = door == null;
+        Transform doorLeaf = FindMovingLeaf(selected);
         if (selected.GetComponent<NetworkObject>() == null)
             Undo.AddComponent<NetworkObject>(selected);
 
-        door = Undo.AddComponent<NetworkLockedDoor>(selected);
-        Collider[] blockers = FindDoorBlockers(selected);
+        if (isNewDoor)
+            door = Undo.AddComponent<NetworkLockedDoor>(selected);
+
+        Collider[] blockers = FindDoorBlockers(doorLeaf);
         SerializedObject serializedDoor = new SerializedObject(door);
-        serializedDoor.FindProperty("doorLeaf").objectReferenceValue = selected.transform;
+        serializedDoor.FindProperty("doorLeaf").objectReferenceValue = doorLeaf;
+        serializedDoor.FindProperty("hingePivot").objectReferenceValue = FindHingePivot(doorLeaf);
         serializedDoor.FindProperty("doorBlockers").arraySize = blockers.Length;
         for (int index = 0; index < blockers.Length; index++)
             serializedDoor.FindProperty("doorBlockers").GetArrayElementAtIndex(index).objectReferenceValue = blockers[index];
-        serializedDoor.FindProperty("requiresTestKey").boolValue = false;
-        serializedDoor.FindProperty("allowGranny").boolValue = true;
+        if (isNewDoor)
+        {
+            serializedDoor.FindProperty("requiresTestKey").boolValue = false;
+            serializedDoor.FindProperty("allowGranny").boolValue = true;
+        }
         serializedDoor.ApplyModifiedProperties();
 
         EditorSceneManager.MarkSceneDirty(activeScene);
         EditorUtility.SetDirty(selected);
         Selection.activeGameObject = selected;
         EditorUtility.DisplayDialog("Door configured",
-            "The selected leaf now has networked open/close control. Check the Inspector: assign a hinge pivot if its imported pivot is not at the hinge, then save OnlineFirstFloor.",
+            "The selected door now has networked open/close control. Check the Inspector: assign or position a hinge pivot if needed, then save OnlineFirstFloor.",
             "OK");
     }
 
@@ -72,14 +74,40 @@ public static class OnlineDoorSetup
                SceneManager.GetActiveScene().name.Equals(OnlineSceneName, StringComparison.OrdinalIgnoreCase);
     }
 
-    private static Collider[] FindDoorBlockers(GameObject selected)
+    private static Transform FindMovingLeaf(GameObject selected)
     {
-        var blockers = selected.GetComponentsInChildren<Collider>(true).ToList();
+        if (selected.name.StartsWith("Door.", StringComparison.Ordinal))
+            return selected.transform;
+
+        Transform leaf = selected.GetComponentsInChildren<Transform>(true)
+            .FirstOrDefault(candidate => candidate != selected.transform && candidate.name.StartsWith("Door.", StringComparison.Ordinal));
+        return leaf != null ? leaf : selected.transform;
+    }
+
+    private static Transform FindHingePivot(Transform doorLeaf)
+    {
+        if (doorLeaf.parent == null)
+            return null;
+
+        string suffix = doorLeaf.name.StartsWith("Door.", StringComparison.Ordinal)
+            ? doorLeaf.name.Substring("Door".Length).Replace(".", "")
+            : string.Empty;
+        if (string.IsNullOrEmpty(suffix))
+            return null;
+
+        string expectedName = "DoorHinge" + suffix;
+        return doorLeaf.parent.GetComponentsInChildren<Transform>(true)
+            .FirstOrDefault(candidate => candidate.name.Equals(expectedName, StringComparison.Ordinal));
+    }
+
+    private static Collider[] FindDoorBlockers(Transform doorLeaf)
+    {
+        var blockers = doorLeaf.GetComponentsInChildren<Collider>(true).ToList();
         GameObject proxyRoot = GameObject.Find(CollisionProxyRootName);
         if (proxyRoot == null)
             return blockers.Distinct().ToArray();
 
-        string matchingProxyName = "Collision - " + selected.name;
+        string matchingProxyName = "Collision - " + doorLeaf.name;
         Transform matchingProxy = proxyRoot.GetComponentsInChildren<Transform>(true)
             .FirstOrDefault(candidate => candidate.name.Equals(matchingProxyName, StringComparison.Ordinal));
         if (matchingProxy != null)

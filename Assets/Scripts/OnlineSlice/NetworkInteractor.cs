@@ -22,6 +22,15 @@ public class NetworkInteractor : NetworkBehaviour
         if (!IsSpawned || !IsOwner || viewCamera == null || !viewCamera.enabled)
             return;
 
+        NetworkPlayerController player = GetComponent<NetworkPlayerController>();
+        if (player == null || !player.MatchStarted.Value)
+        {
+            focusedPickup = null;
+            focusedDoor = null;
+            focusedExit = null;
+            return;
+        }
+
         focusedPickup = null;
         focusedDoor = null;
         focusedExit = null;
@@ -56,7 +65,8 @@ public class NetworkInteractor : NetworkBehaviour
         if (focusedPickup != null)
             message = "E  Pick up key";
         else if (focusedDoor != null)
-            message = focusedDoor.IsOpen.Value ? "E  Close door" : "E  Open door";
+            message = focusedDoor.GetInteractionPrompt(
+                GetComponent<NetworkPlayerController>(), GetComponent<NetworkInventory>());
         else if (focusedExit != null)
             message = "E  Escape";
 

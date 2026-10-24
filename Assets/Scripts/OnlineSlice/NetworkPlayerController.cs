@@ -25,6 +25,16 @@ public class NetworkPlayerController : NetworkBehaviour
     private bool isCrouched;
     private Vector3 lastWallNormal;
 
+    public NetworkVariable<bool> IsReady = new(
+        false,
+        NetworkVariableReadPermission.Everyone,
+        NetworkVariableWritePermission.Server);
+
+    public NetworkVariable<bool> MatchStarted = new(
+        false,
+        NetworkVariableReadPermission.Everyone,
+        NetworkVariableWritePermission.Server);
+
     public bool IsGranny => Unity.Netcode.NetworkManager.Singleton != null &&
                             OwnerClientId == Unity.Netcode.NetworkManager.ServerClientId;
 
@@ -38,6 +48,7 @@ public class NetworkPlayerController : NetworkBehaviour
 
     public override void OnNetworkSpawn()
     {
+        MatchStarted.OnValueChanged += OnMatchStartedChanged;
         bool isLocalPlayer = IsOwner;
 
         if (playerCamera != null)
@@ -61,15 +72,74 @@ public class NetworkPlayerController : NetworkBehaviour
             Physics.SyncTransforms();
             characterController.enabled = true;
             verticalSpeed = 0f;
-            LockCursor();
+            UnlockCursor();
+            if (MatchStarted.Value)
+                LockCursor();
         }
 
         ApplyRoleColor();
     }
 
+    public override void OnNetworkDespawn()
+    {
+        MatchStarted.OnValueChanged -= OnMatchStartedChanged;
+        if (IsOwner)
+            UnlockCursor();
+    }
+
+    [Rpc(SendTo.Server, InvokePermission = RpcInvokePermission.Owner)]
+    public void SetReadyRpc(bool ready, RpcParams rpcParams = default)
+    {
+        if (MatchStarted.Value || rpcParams.Receive.SenderClientId != OwnerClientId)
+            return;
+
+        IsReady.Value = ready;
+    }
+
+    [Rpc(SendTo.Server, InvokePermission = RpcInvokePermission.Owner)]
+    public void RequestStartMatchRpc(RpcParams rpcParams = default)
+    {
+        Unity.Netcode.NetworkManager manager = Unity.Netcode.NetworkManager.Singleton;
+        if (!IsServer || manager == null || rpcParams.Receive.SenderClientId != Unity.Netcode.NetworkManager.ServerClientId)
+            return;
+
+        if (manager.ConnectedClientsIds.Count != 2)
+            return;
+
+        foreach (ulong clientId in manager.ConnectedClientsIds)
+        {
+            if (!manager.ConnectedClients.TryGetValue(clientId, out NetworkClient client) ||
+                client.PlayerObject == null ||
+                !client.PlayerObject.TryGetComponent(out NetworkPlayerController player) ||
+                !player.IsReady.Value)
+                return;
+        }
+
+        foreach (ulong clientId in manager.ConnectedClientsIds)
+        {
+            NetworkPlayerController player = manager.ConnectedClients[clientId].PlayerObject
+                .GetComponent<NetworkPlayerController>();
+            player.MatchStarted.Value = true;
+        }
+    }
+
+    private void OnMatchStartedChanged(bool previousValue, bool newValue)
+    {
+        if (!IsOwner)
+            return;
+
+        if (newValue)
+            LockCursor();
+        else
+            UnlockCursor();
+    }
+
     private void Update()
     {
         if (!IsSpawned || !IsOwner)
+            return;
+
+        if (!MatchStarted.Value)
             return;
 
         Keyboard keyboard = Keyboard.current;

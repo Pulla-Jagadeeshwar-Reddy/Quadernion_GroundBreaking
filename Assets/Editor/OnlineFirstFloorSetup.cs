@@ -67,6 +67,92 @@ public static class OnlineFirstFloorSetup
             "OK");
     }
 
+    [MenuItem("Tools/First Floor/Rebuild Simple Collision Proxies")]
+    private static void RebuildSimpleCollisionProxies()
+    {
+        if (!EditorUtility.DisplayDialog(
+                "Rebuild first-floor collision",
+                "This changes collision in OnlineFirstFloor only. It replaces the imported map's detailed MeshColliders " +
+                "with simple box colliders built from each mesh's bounds. This is intended to stop the player catching on triangle seams.",
+                "Rebuild collision",
+                "Cancel"))
+            return;
+
+        Scene scene = EditorSceneManager.OpenScene(ScenePath, OpenSceneMode.Single);
+        GameObject firstFloor = GameObject.Find("FirstFloor");
+        GameObject mainModel = GameObject.Find("Main");
+        if (firstFloor == null)
+        {
+            EditorUtility.DisplayDialog("FirstFloor model not found",
+                "The copied scene does not contain a root named FirstFloor. No collision was changed.", "OK");
+            return;
+        }
+
+        GameObject oldProxyRoot = GameObject.Find("Online Collision Proxies");
+        if (oldProxyRoot != null)
+            Undo.DestroyObjectImmediate(oldProxyRoot);
+
+        GameObject proxyRoot = new GameObject("Online Collision Proxies");
+        Undo.RegisterCreatedObjectUndo(proxyRoot, "Create simple first-floor collision proxies");
+
+        GameObject[] modelRoots = mainModel == null
+            ? new[] { firstFloor }
+            : new[] { firstFloor, mainModel };
+        MeshFilter[] meshFilters = modelRoots
+            .SelectMany(root => root.GetComponentsInChildren<MeshFilter>(true))
+            .Where(filter => filter.sharedMesh != null && filter.GetComponent<Renderer>() != null)
+            .ToArray();
+
+        int proxyCount = 0;
+        foreach (MeshFilter meshFilter in meshFilters)
+        {
+            Bounds meshBounds = meshFilter.sharedMesh.bounds;
+            Vector3 worldSize = Vector3.Scale(meshBounds.size, meshFilter.transform.lossyScale);
+            if (worldSize.magnitude < 0.25f)
+                continue;
+
+            GameObject proxy = new GameObject("Collision - " + meshFilter.name);
+            Undo.RegisterCreatedObjectUndo(proxy, "Create map collision proxy");
+            proxy.transform.SetParent(proxyRoot.transform, false);
+            proxy.transform.SetPositionAndRotation(meshFilter.transform.position, meshFilter.transform.rotation);
+            proxy.transform.localScale = meshFilter.transform.lossyScale;
+
+            BoxCollider box = proxy.AddComponent<BoxCollider>();
+            box.center = meshBounds.center;
+            box.size = new Vector3(
+                Mathf.Max(meshBounds.size.x, 0.08f),
+                Mathf.Max(meshBounds.size.y, 0.08f),
+                Mathf.Max(meshBounds.size.z, 0.08f));
+            proxyCount++;
+        }
+
+        if (proxyCount == 0)
+        {
+            Undo.DestroyObjectImmediate(proxyRoot);
+            EditorUtility.DisplayDialog("No collision proxies created",
+                "No renderable map meshes were found. The existing collision was left in place.", "OK");
+            return;
+        }
+
+        int removedMeshColliders = 0;
+        foreach (MeshFilter meshFilter in meshFilters)
+        {
+            MeshCollider meshCollider = meshFilter.GetComponent<MeshCollider>();
+            if (meshCollider == null)
+                continue;
+
+            Undo.DestroyObjectImmediate(meshCollider);
+            removedMeshColliders++;
+        }
+
+        EditorSceneManager.MarkSceneDirty(scene);
+        EditorSceneManager.SaveScene(scene, ScenePath);
+        EditorUtility.DisplayDialog("Simple collision rebuilt",
+            $"Created {proxyCount} box collision proxies and removed {removedMeshColliders} mesh colliders in OnlineFirstFloor. " +
+            "The original scenes were not touched. Playtest wall movement and crouch release; if a doorway is blocked, disable its corresponding Collision object in the Online Collision Proxies group.",
+            "OK");
+    }
+
     private static void DisableLegacyOfflineObjects()
     {
         GameObject oldPlayer = GameObject.Find(LegacyPlayerName);

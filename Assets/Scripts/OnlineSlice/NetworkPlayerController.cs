@@ -161,7 +161,10 @@ public class NetworkPlayerController : NetworkBehaviour
 
         // Check only the space added above the crouched capsule. A full-capsule overlap test
         // incorrectly treats a wall the player is already touching as a ceiling obstruction.
-        float clearanceRadius = Mathf.Max(0.05f, radius - characterController.skinWidth * 1.25f);
+        // Keep this narrow around the character's centerline. Using the full body radius
+        // makes an adjacent wall look like an overhead obstruction while crouched.
+        float clearanceRadius = Mathf.Min(0.12f, radius - characterController.skinWidth * 1.25f);
+        clearanceRadius = Mathf.Max(0.05f, clearanceRadius);
         float sampleSpacing = Mathf.Max(clearanceRadius * 0.75f, 0.05f);
         float addedHeight = Vector3.Distance(crouchedUpperSphereCenter, standingUpperSphereCenter);
         int sampleCount = Mathf.Max(1, Mathf.CeilToInt(addedHeight / sampleSpacing));

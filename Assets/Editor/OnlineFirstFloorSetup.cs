@@ -143,14 +143,18 @@ public static class OnlineFirstFloorSetup
     private static void CreateOrUpdateMarker(string markerName, Vector3 position, Quaternion rotation, Color color)
     {
         GameObject marker = GameObject.Find(markerName);
+        bool created = marker == null;
         if (marker == null)
         {
             marker = new GameObject(markerName);
             Undo.RegisterCreatedObjectUndo(marker, $"Create {markerName}");
         }
 
-        Undo.RecordObject(marker.transform, $"Place {markerName}");
-        marker.transform.SetPositionAndRotation(position, rotation);
+        if (created)
+        {
+            Undo.RecordObject(marker.transform, $"Place {markerName}");
+            marker.transform.SetPositionAndRotation(position, rotation);
+        }
         OnlineSpawnMarker markerVisualization = marker.GetComponent<OnlineSpawnMarker>();
         if (markerVisualization == null)
             markerVisualization = Undo.AddComponent<OnlineSpawnMarker>(marker);

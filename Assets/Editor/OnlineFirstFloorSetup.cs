@@ -43,9 +43,9 @@ public static class OnlineFirstFloorSetup
         }
 
         DisableLegacyOfflineObjects();
-        int collidersAdded = AddStaticMeshColliders(firstFloor);
+        int collidersConfigured = ConfigureStaticMeshColliders(firstFloor);
         if (mainModel != null)
-            collidersAdded += AddStaticMeshColliders(mainModel);
+            collidersConfigured += ConfigureStaticMeshColliders(mainModel);
 
         Bounds mapBounds = GetMapBounds(firstFloor, mainModel);
         CreateOrUpdateMarker("Granny Spawn Marker",
@@ -62,7 +62,7 @@ public static class OnlineFirstFloorSetup
         AssetDatabase.SaveAssets();
 
         EditorUtility.DisplayDialog("Online first-floor setup complete",
-            $"Configured {ScenePath}. Added {collidersAdded} MeshCollider component(s). " +
+            $"Configured {ScenePath}. Added or refreshed {collidersConfigured} MeshCollider component(s). " +
             "The spawn markers are at the map bounds center; inspect and move them in Scene view to safe, open floor locations before playtesting.",
             "OK");
     }
@@ -95,21 +95,33 @@ public static class OnlineFirstFloorSetup
         }
     }
 
-    private static int AddStaticMeshColliders(GameObject root)
+    private static int ConfigureStaticMeshColliders(GameObject root)
     {
-        int added = 0;
+        int configured = 0;
         foreach (MeshFilter meshFilter in root.GetComponentsInChildren<MeshFilter>(true))
         {
-            if (meshFilter.sharedMesh == null || meshFilter.GetComponent<Collider>() != null)
+            if (meshFilter.sharedMesh == null)
                 continue;
 
-            MeshCollider meshCollider = Undo.AddComponent<MeshCollider>(meshFilter.gameObject);
+            MeshCollider meshCollider = meshFilter.GetComponent<MeshCollider>();
+            if (meshCollider == null)
+            {
+                if (meshFilter.GetComponent<Collider>() != null)
+                    continue;
+                meshCollider = Undo.AddComponent<MeshCollider>(meshFilter.gameObject);
+            }
+
+            Undo.RecordObject(meshCollider, "Configure first-floor mesh collider");
+            meshCollider.sharedMesh = null;
             meshCollider.sharedMesh = meshFilter.sharedMesh;
             meshCollider.convex = false;
-            added++;
+            meshCollider.cookingOptions = MeshColliderCookingOptions.CookForFasterSimulation |
+                                         MeshColliderCookingOptions.EnableMeshCleaning |
+                                         MeshColliderCookingOptions.WeldColocatedVertices;
+            configured++;
         }
 
-        return added;
+        return configured;
     }
 
     private static Bounds GetMapBounds(params GameObject[] roots)

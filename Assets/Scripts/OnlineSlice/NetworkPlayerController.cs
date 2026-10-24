@@ -23,6 +23,7 @@ public class NetworkPlayerController : NetworkBehaviour
     private float pitch;
     private bool cursorLocked;
     private bool isCrouched;
+    private Vector3 lastWallNormal;
 
     public bool IsGranny => Unity.Netcode.NetworkManager.Singleton != null &&
                             OwnerClientId == Unity.Netcode.NetworkManager.ServerClientId;
@@ -110,11 +111,41 @@ public class NetworkPlayerController : NetworkBehaviour
         if (characterController.isGrounded && verticalSpeed < 0f)
             verticalSpeed = -2f;
 
-        verticalSpeed += gravity * Time.deltaTime;
         float currentMoveSpeed = isCrouched ? moveSpeed * crouchSpeedMultiplier : moveSpeed;
-        Vector3 velocity = direction * currentMoveSpeed;
-        velocity.y = verticalSpeed;
-        characterController.Move(velocity * Time.deltaTime);
+        MoveHorizontally(direction * currentMoveSpeed * Time.deltaTime);
+
+        verticalSpeed += gravity * Time.deltaTime;
+        characterController.Move(Vector3.up * (verticalSpeed * Time.deltaTime));
+    }
+
+    private void MoveHorizontally(Vector3 displacement)
+    {
+        if (displacement.sqrMagnitude <= 0.000001f)
+            return;
+
+        Vector3 startPosition = transform.position;
+        lastWallNormal = Vector3.zero;
+        CollisionFlags collisionFlags = characterController.Move(displacement);
+
+        if ((collisionFlags & CollisionFlags.Sides) == 0 || lastWallNormal.sqrMagnitude < 0.01f)
+            return;
+
+        Vector3 actualDisplacement = transform.position - startPosition;
+        actualDisplacement.y = 0f;
+        Vector3 remainingDisplacement = displacement - actualDisplacement;
+        Vector3 slideDisplacement = Vector3.ProjectOnPlane(remainingDisplacement, lastWallNormal);
+        slideDisplacement.y = 0f;
+
+        // CharacterController usually slides by itself; this applies only residual movement
+        // that was blocked by a mesh edge or near-coplanar wall seam.
+        if (slideDisplacement.sqrMagnitude > 0.000001f)
+            characterController.Move(slideDisplacement);
+    }
+
+    private void OnControllerColliderHit(ControllerColliderHit hit)
+    {
+        if (Mathf.Abs(hit.normal.y) < 0.5f)
+            lastWallNormal = hit.normal;
     }
 
     private bool CanStandUp()
@@ -124,22 +155,29 @@ public class NetworkPlayerController : NetworkBehaviour
         float radius = characterController.radius * Mathf.Max(standingScale.x, standingScale.z);
         Vector3 standingRootPosition = transform.position + transform.up * ((standingHeight - crouchedHeight) * 0.5f);
         Vector3 centerOffset = transform.rotation * Vector3.Scale(characterController.center, standingScale);
-        Vector3 capsuleCenter = standingRootPosition + centerOffset;
-        float halfSegment = Mathf.Max(0f, standingHeight * 0.5f - radius);
-        Vector3 lower = capsuleCenter - transform.up * halfSegment;
-        Vector3 upper = capsuleCenter + transform.up * halfSegment;
-        float footHeight = capsuleCenter.y - standingHeight * 0.5f;
-        float floorContactTolerance = characterController.skinWidth * Mathf.Max(standingScale.y, 1f);
+        Vector3 standingCenter = standingRootPosition + centerOffset;
+        Vector3 crouchedUpperSphereCenter = standingCenter + transform.up * (crouchedHeight * 0.5f - radius);
+        Vector3 standingUpperSphereCenter = standingCenter + transform.up * (standingHeight * 0.5f - radius);
 
-        Collider[] overlaps = Physics.OverlapCapsule(lower, upper, radius, ~0, QueryTriggerInteraction.Ignore);
-        foreach (Collider overlap in overlaps)
+        // Check only the space added above the crouched capsule. A full-capsule overlap test
+        // incorrectly treats a wall the player is already touching as a ceiling obstruction.
+        float clearanceRadius = Mathf.Max(0.05f, radius - characterController.skinWidth * 1.25f);
+        float sampleSpacing = Mathf.Max(clearanceRadius * 0.75f, 0.05f);
+        float addedHeight = Vector3.Distance(crouchedUpperSphereCenter, standingUpperSphereCenter);
+        int sampleCount = Mathf.Max(1, Mathf.CeilToInt(addedHeight / sampleSpacing));
+
+        for (int index = 0; index <= sampleCount; index++)
         {
-            if (overlap == characterController || overlap.transform == transform || overlap.transform.IsChildOf(transform))
-                continue;
-            if (overlap.bounds.max.y <= footHeight + floorContactTolerance)
-                continue;
+            float t = index / (float)sampleCount;
+            Vector3 sampleCenter = Vector3.Lerp(crouchedUpperSphereCenter, standingUpperSphereCenter, t);
+            Collider[] overlaps = Physics.OverlapSphere(sampleCenter, clearanceRadius, ~0, QueryTriggerInteraction.Ignore);
+            foreach (Collider overlap in overlaps)
+            {
+                if (overlap == characterController || overlap.transform == transform || overlap.transform.IsChildOf(transform))
+                    continue;
 
-            return false;
+                return false;
+            }
         }
 
         return true;

@@ -42,6 +42,8 @@ public class NetworkInteractor : NetworkBehaviour
             if (focusedPickup == null)
                 focusedDoor = hit.collider.GetComponentInParent<NetworkLockedDoor>();
             if (focusedPickup == null && focusedDoor == null)
+                NetworkLockedDoor.TryFindForCollider(hit.collider, out focusedDoor);
+            if (focusedPickup == null && focusedDoor == null)
                 focusedExit = hit.collider.GetComponentInParent<NetworkEscapePoint>();
         }
 
@@ -72,7 +74,7 @@ public class NetworkInteractor : NetworkBehaviour
 
         if (!string.IsNullOrEmpty(message))
         {
-            GUI.Box(new Rect(Screen.width * 0.5f - 90f, Screen.height * 0.72f, 180f, 32f), message);
+            GUI.Box(new Rect(Screen.width * 0.5f - 140f, Screen.height * 0.72f, 280f, 36f), message);
         }
 
         if (IsGranny())

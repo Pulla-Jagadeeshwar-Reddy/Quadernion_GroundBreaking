@@ -1,9 +1,12 @@
 using Unity.Netcode;
+using System.Collections.Generic;
 using UnityEngine;
 
 [RequireComponent(typeof(NetworkObject))]
 public class NetworkLockedDoor : NetworkBehaviour
 {
+    private static readonly List<NetworkLockedDoor> SpawnedDoors = new();
+
     [Header("Door motion")]
     [Tooltip("Assign the moving door leaf. Use Hinge Pivot for a separate hinge point; do not assign the stationary frame.")]
     [SerializeField] private Transform doorLeaf;
@@ -55,6 +58,9 @@ public class NetworkLockedDoor : NetworkBehaviour
 
     public override void OnNetworkSpawn()
     {
+        if (!SpawnedDoors.Contains(this))
+            SpawnedDoors.Add(this);
+
         if (IsServer)
             IsOpen.Value = false;
 
@@ -74,6 +80,49 @@ public class NetworkLockedDoor : NetworkBehaviour
     public override void OnNetworkDespawn()
     {
         IsOpen.OnValueChanged -= OnOpenChanged;
+        SpawnedDoors.Remove(this);
+    }
+
+    public static bool TryFindForCollider(Collider collider, out NetworkLockedDoor door)
+    {
+        for (int index = SpawnedDoors.Count - 1; index >= 0; index--)
+        {
+            NetworkLockedDoor candidate = SpawnedDoors[index];
+            if (candidate == null || !candidate.IsSpawned)
+            {
+                SpawnedDoors.RemoveAt(index);
+                continue;
+            }
+
+            if (!candidate.OwnsCollider(collider))
+                continue;
+
+            door = candidate;
+            return true;
+        }
+
+        door = null;
+        return false;
+    }
+
+    private bool OwnsCollider(Collider collider)
+    {
+        if (collider == null)
+            return false;
+
+        if (doorLeaf != null && (collider.transform == doorLeaf || collider.transform.IsChildOf(doorLeaf)))
+            return true;
+
+        if (doorBlockers == null)
+            return false;
+
+        foreach (Collider blocker in doorBlockers)
+        {
+            if (blocker == collider)
+                return true;
+        }
+
+        return false;
     }
 
     private void Update()
@@ -129,7 +178,8 @@ public class NetworkLockedDoor : NetworkBehaviour
             return;
 
         NetworkObject playerObject = client.PlayerObject;
-        if (playerObject == null || Vector3.Distance(playerObject.transform.position, transform.position) > serverInteractionRange)
+        Vector3 interactionPoint = doorLeaf != null ? doorLeaf.position : transform.position;
+        if (playerObject == null || Vector3.Distance(playerObject.transform.position, interactionPoint) > serverInteractionRange)
             return;
 
         NetworkPlayerController role = playerObject.GetComponent<NetworkPlayerController>();
@@ -162,5 +212,18 @@ public class NetworkLockedDoor : NetworkBehaviour
             if (blocker != null)
                 blocker.enabled = enabled;
         }
+    }
+
+    private void OnDrawGizmosSelected()
+    {
+        if (hingePivot == null)
+            return;
+
+        Vector3 point = hingePivot.position;
+        Gizmos.color = Color.yellow;
+        Gizmos.DrawSphere(point, 0.09f);
+        Gizmos.DrawLine(point - Vector3.up * 0.35f, point + Vector3.up * 0.35f);
+        Gizmos.color = Color.cyan;
+        Gizmos.DrawRay(point, hingePivot.up * 0.55f);
     }
 }

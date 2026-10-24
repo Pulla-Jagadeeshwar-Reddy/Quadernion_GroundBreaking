@@ -337,5 +337,7 @@ MonoBehaviour:
   mouseSensitivity: 0.12
   moveSpeed: 4
   gravity: -20
+  crouchScale: 0.55
+  crouchSpeedMultiplier: 0.45
   grannySpawn: {x: -2, y: 1.5, z: 0}
   runnerSpawn: {x: 2, y: 1.5, z: -2}

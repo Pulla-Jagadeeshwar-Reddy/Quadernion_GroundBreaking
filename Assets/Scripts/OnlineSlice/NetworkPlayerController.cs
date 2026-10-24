@@ -49,9 +49,14 @@ public class NetworkPlayerController : NetworkBehaviour
 
         if (isLocalPlayer)
         {
-            Vector3 spawnPosition = IsGranny ? grannySpawn : runnerSpawn;
+            string markerName = IsGranny ? "Granny Spawn Marker" : "Player Spawn Marker";
+            Transform spawnMarker = GameObject.Find(markerName)?.transform;
+            Vector3 spawnPosition = spawnMarker != null
+                ? spawnMarker.position
+                : (IsGranny ? grannySpawn : runnerSpawn);
+            Quaternion spawnRotation = spawnMarker != null ? spawnMarker.rotation : Quaternion.identity;
             characterController.enabled = false;
-            transform.SetPositionAndRotation(spawnPosition, Quaternion.identity);
+            transform.SetPositionAndRotation(spawnPosition, spawnRotation);
             Physics.SyncTransforms();
             characterController.enabled = true;
             verticalSpeed = 0f;

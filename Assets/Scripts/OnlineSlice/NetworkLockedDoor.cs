@@ -34,13 +34,33 @@ public class NetworkLockedDoor : NetworkBehaviour
     private Quaternion closedWorldRotation;
     private Vector3 openWorldPosition;
     private Quaternion openWorldRotation;
+    private bool isDuplicateComponent;
 
     private void Awake()
     {
+        NetworkLockedDoor[] components = GetComponents<NetworkLockedDoor>();
+        for (int index = 0; index < components.Length; index++)
+        {
+            if (components[index] != this)
+                continue;
+
+            isDuplicateComponent = index > 0;
+            break;
+        }
+
+        // A duplicate component can otherwise fight the active component over the same leaf.
+        if (isDuplicateComponent)
+            return;
+
         if (doorLeaf == null)
             doorLeaf = transform;
 
         doorRenderers = doorLeaf.GetComponentsInChildren<Renderer>(true);
+
+        // Existing scene instances may still serialize the old common angle. Infer the
+        // correct sign from each leaf's handle side before calculating its open pose.
+        if (TryGetHandleSide(out bool handleOnRight))
+            openEulerAngles = new Vector3(0f, 0f, handleOnRight ? -90f : 90f);
 
         closedRotation = doorLeaf.localRotation;
         openRotation = closedRotation * Quaternion.Euler(openEulerAngles);
@@ -59,8 +79,74 @@ public class NetworkLockedDoor : NetworkBehaviour
             doorBlockers = doorLeaf.GetComponents<Collider>();
     }
 
+    private bool TryGetHandleSide(out bool handleOnRight)
+    {
+        handleOnRight = true;
+        Transform[] handles = doorLeaf.GetComponentsInChildren<Transform>(true);
+        float handleXTotal = 0f;
+        int handleCount = 0;
+        foreach (Transform child in handles)
+        {
+            if (!child.name.StartsWith("Handle", System.StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            handleXTotal += doorLeaf.InverseTransformPoint(child.position).x;
+            handleCount++;
+        }
+
+        if (handleCount == 0 || !TryGetDoorBoundsInLocalSpace(out Bounds doorBounds))
+            return false;
+
+        handleOnRight = handleXTotal / handleCount >= doorBounds.center.x;
+        return true;
+    }
+
+    private bool TryGetDoorBoundsInLocalSpace(out Bounds bounds)
+    {
+        bool hasBounds = false;
+        bounds = default;
+        foreach (Renderer targetRenderer in doorRenderers)
+        {
+            if (targetRenderer == null || IsHandlePart(targetRenderer.transform))
+                continue;
+
+            Bounds worldBounds = targetRenderer.bounds;
+            for (int corner = 0; corner < 8; corner++)
+            {
+                Vector3 worldPoint = new Vector3(
+                    (corner & 1) == 0 ? worldBounds.min.x : worldBounds.max.x,
+                    (corner & 2) == 0 ? worldBounds.min.y : worldBounds.max.y,
+                    (corner & 4) == 0 ? worldBounds.min.z : worldBounds.max.z);
+                Vector3 localPoint = doorLeaf.InverseTransformPoint(worldPoint);
+                if (hasBounds)
+                    bounds.Encapsulate(localPoint);
+                else
+                {
+                    bounds = new Bounds(localPoint, Vector3.zero);
+                    hasBounds = true;
+                }
+            }
+        }
+
+        return hasBounds;
+    }
+
+    private bool IsHandlePart(Transform candidate)
+    {
+        for (Transform current = candidate; current != null && current != doorLeaf; current = current.parent)
+        {
+            if (current.name.StartsWith("Handle", System.StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
+    }
+
     public override void OnNetworkSpawn()
     {
+        if (isDuplicateComponent)
+            return;
+
         if (!SpawnedDoors.Contains(this))
             SpawnedDoors.Add(this);
 
@@ -82,6 +168,9 @@ public class NetworkLockedDoor : NetworkBehaviour
 
     public override void OnNetworkDespawn()
     {
+        if (isDuplicateComponent)
+            return;
+
         IsOpen.OnValueChanged -= OnOpenChanged;
         SpawnedDoors.Remove(this);
     }
@@ -214,6 +303,9 @@ public class NetworkLockedDoor : NetworkBehaviour
 
     private void Update()
     {
+        if (isDuplicateComponent)
+            return;
+
         if (hingePivot != null)
         {
             Vector3 targetPosition = IsOpen.Value ? openWorldPosition : closedWorldPosition;
@@ -244,7 +336,7 @@ public class NetworkLockedDoor : NetworkBehaviour
 
     public string GetInteractionPrompt(NetworkPlayerController player, NetworkInventory inventory)
     {
-        if (!IsSpawned || player == null)
+        if (isDuplicateComponent || !IsSpawned || player == null)
             return string.Empty;
 
         if (player.IsGranny && !allowGranny)
@@ -259,6 +351,9 @@ public class NetworkLockedDoor : NetworkBehaviour
     [Rpc(SendTo.Server, InvokePermission = RpcInvokePermission.Everyone)]
     public void InteractRpc(RpcParams rpcParams = default)
     {
+        if (isDuplicateComponent)
+            return;
+
         ulong senderId = rpcParams.Receive.SenderClientId;
         Unity.Netcode.NetworkManager manager = Unity.Netcode.NetworkManager.Singleton;
         if (manager == null || !manager.ConnectedClients.TryGetValue(senderId, out NetworkClient client))
@@ -303,7 +398,7 @@ public class NetworkLockedDoor : NetworkBehaviour
 
     private void OnDrawGizmosSelected()
     {
-        if (hingePivot == null)
+        if (isDuplicateComponent || hingePivot == null)
             return;
 
         Vector3 point = hingePivot.position;

@@ -85,7 +85,7 @@ public static class OnlineDoorSetup
         }
 
         if (!EditorUtility.DisplayDialog("Configure all first-floor doors",
-                $"Configure {doors.Length} first-floor doors while keeping their existing hinges? Right-handle doors use (0, 0, -90); left-handle doors use (0, 0, 90) so they swing the opposite way.",
+                $"Configure {doors.Length} first-floor doors while keeping existing hinge objects? Right-handle doors use (0, 0, -90), left-handle doors use (0, 0, 90). Duplicate NetworkLockedDoor components on the same object will be removed.",
                 "Configure all", "Cancel"))
             return;
 
@@ -93,6 +93,9 @@ public static class OnlineDoorSetup
         Undo.SetCurrentGroupName("Configure all first-floor doors");
         int configured = 0;
         int missingHinge = 0;
+        int rightHandleDoors = 0;
+        int leftHandleDoors = 0;
+        int duplicateComponents = 0;
         foreach (Transform group in doors)
         {
             Transform leaf = FindMovingLeaf(group.gameObject);
@@ -102,29 +105,37 @@ public static class OnlineDoorSetup
                 Debug.LogWarning($"[OnlineDoorSetup] Could not create a hinge pivot for {group.name}; check that its door mesh has a Renderer.", group.gameObject);
             }
 
-            ConfigureDoor(group.gameObject);
+            duplicateComponents += Mathf.Max(0, group.GetComponents<NetworkLockedDoor>().Length - 1);
+            if (ConfigureDoor(group.gameObject))
+                rightHandleDoors++;
+            else
+                leftHandleDoors++;
             configured++;
         }
 
         EditorSceneManager.MarkSceneDirty(activeScene);
         Selection.objects = doors.Select(group => group.gameObject).ToArray();
         EditorUtility.DisplayDialog("Doors configured",
-            $"Configured {configured} doors. {missingHinge} have no matching DoorHinge* pivot; inspect those hinges and save OnlineFirstFloor.",
+            $"Configured {configured} doors: {rightHandleDoors} right-handle (-90), {leftHandleDoors} left-handle (+90). Removed {duplicateComponents} duplicate door components. {missingHinge} hinges could not be found or created. Save OnlineFirstFloor.",
             "OK");
     }
 
-    private static void ConfigureDoor(GameObject selected)
+    private static bool ConfigureDoor(GameObject selected)
     {
-        bool isNewDoor = selected.GetComponent<NetworkLockedDoor>() == null;
+        NetworkLockedDoor[] existingDoors = selected.GetComponents<NetworkLockedDoor>();
+        bool isNewDoor = existingDoors.Length == 0;
         Transform doorLeaf = FindMovingLeaf(selected);
         if (selected.GetComponent<NetworkObject>() == null)
             Undo.AddComponent<NetworkObject>(selected);
 
-        NetworkLockedDoor door = selected.GetComponent<NetworkLockedDoor>();
+        NetworkLockedDoor door = existingDoors.Length > 0 ? existingDoors[0] : null;
         if (door == null)
             door = Undo.AddComponent<NetworkLockedDoor>(selected);
         else
             Undo.RecordObject(door, "Configure networked door");
+
+        for (int index = 1; index < existingDoors.Length; index++)
+            Undo.DestroyObjectImmediate(existingDoors[index]);
 
         Collider[] blockers = FindDoorBlockers(doorLeaf);
         SerializedObject serializedDoor = new SerializedObject(door);
@@ -133,8 +144,9 @@ public static class OnlineDoorSetup
         serializedDoor.FindProperty("doorBlockers").arraySize = blockers.Length;
         for (int index = 0; index < blockers.Length; index++)
             serializedDoor.FindProperty("doorBlockers").GetArrayElementAtIndex(index).objectReferenceValue = blockers[index];
+        bool handleOnRight = HandleIsOnLocalRight(doorLeaf);
         serializedDoor.FindProperty("openEulerAngles").vector3Value =
-            new Vector3(0f, 0f, HandleIsOnLocalRight(doorLeaf) ? -90f : 90f);
+            new Vector3(0f, 0f, handleOnRight ? -90f : 90f);
         if (isNewDoor)
         {
             serializedDoor.FindProperty("requiresTestKey").boolValue = false;
@@ -143,6 +155,8 @@ public static class OnlineDoorSetup
         serializedDoor.ApplyModifiedProperties();
         EditorUtility.SetDirty(selected);
         EditorUtility.SetDirty(door);
+        Debug.Log($"[OnlineDoorSetup] {selected.name}: {(handleOnRight ? "right handle, -90" : "left handle, +90")}; hinge={serializedDoor.FindProperty("hingePivot").objectReferenceValue?.name ?? "MISSING"}.", selected);
+        return handleOnRight;
     }
 
     [MenuItem("Tools/First Floor/Make Selected Door Networked", true)]

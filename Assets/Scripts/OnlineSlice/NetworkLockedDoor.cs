@@ -15,7 +15,7 @@ public class NetworkLockedDoor : NetworkBehaviour
     [SerializeField] private Transform hingePivot;
     [Tooltip("Optional colliders that physically block the doorway while closed. Include the matching Online Collision Proxies collider if one exists.")]
     [SerializeField] private Collider[] doorBlockers;
-    [SerializeField] private Vector3 openEulerAngles = new(0f, 90f, 0f);
+    [SerializeField] private Vector3 openEulerAngles = new(0f, 0f, -90f);
     [SerializeField] private float animationSpeed = 5f;
 
     [Header("Access")]

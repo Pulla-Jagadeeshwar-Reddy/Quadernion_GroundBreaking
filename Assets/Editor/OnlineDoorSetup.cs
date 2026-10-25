@@ -59,11 +59,24 @@ public static class OnlineDoorSetup
             return;
         }
 
-        Transform[] groups = activeScene.GetRootGameObjects()
+        Transform[] sceneTransforms = activeScene.GetRootGameObjects()
             .SelectMany(root => root.GetComponentsInChildren<Transform>(true))
-            .Where(candidate => candidate.name.StartsWith(DoorGroupPrefix, StringComparison.Ordinal))
             .ToArray();
-        Transform[] doors = groups.Where(group => FindMovingLeaf(group.gameObject) != group).ToArray();
+        var doorObjects = new System.Collections.Generic.HashSet<GameObject>();
+        foreach (Transform group in sceneTransforms.Where(candidate =>
+                     candidate.name.StartsWith(DoorGroupPrefix, StringComparison.Ordinal)))
+        {
+            if (FindMovingLeaf(group.gameObject) != group)
+                doorObjects.Add(group.gameObject);
+        }
+
+        foreach (Transform candidate in sceneTransforms)
+        {
+            if (candidate.GetComponent<NetworkLockedDoor>() != null)
+                doorObjects.Add(candidate.gameObject);
+        }
+
+        Transform[] doors = doorObjects.Select(gameObject => gameObject.transform).ToArray();
         if (doors.Length == 0)
         {
             EditorUtility.DisplayDialog("No doors found",

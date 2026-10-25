@@ -108,9 +108,12 @@ public class NetworkLockedDoor : NetworkBehaviour
         return false;
     }
 
-    public static bool TryFindContainingCamera(Vector3 cameraPosition, Vector3 playerPosition, float maxDistance,
+    public static bool TryFindAimedDoor(Ray viewRay, Vector3 playerPosition, float maxDistance,
         out NetworkLockedDoor door)
     {
+        float nearestDoorDistance = float.PositiveInfinity;
+        door = null;
+
         for (int index = SpawnedDoors.Count - 1; index >= 0; index--)
         {
             NetworkLockedDoor candidate = SpawnedDoors[index];
@@ -120,40 +123,73 @@ public class NetworkLockedDoor : NetworkBehaviour
                 continue;
             }
 
-            Vector3 doorPosition = candidate.doorLeaf != null ? candidate.doorLeaf.position : candidate.transform.position;
-            if (Vector3.Distance(playerPosition, doorPosition) > maxDistance ||
-                !candidate.ContainsCameraPosition(cameraPosition))
+            if (!candidate.TryGetLeafBounds(out Bounds leafBounds) ||
+                Vector3.Distance(playerPosition, leafBounds.ClosestPoint(playerPosition)) > maxDistance)
                 continue;
 
+            bool rayStartsInsideDoor = leafBounds.Contains(viewRay.origin);
+            float boundsDistance = 0f;
+            if (!rayStartsInsideDoor && !leafBounds.IntersectRay(viewRay, out boundsDistance))
+                continue;
+            if (boundsDistance > maxDistance || boundsDistance >= nearestDoorDistance)
+                continue;
+
+            // Imported floor collision boxes can overlap a visible door's bounds. Ignore an
+            // obstruction only when its bounds overlap the door bounds; unrelated walls still block.
+            if (!rayStartsInsideDoor &&
+                Physics.Raycast(viewRay, out RaycastHit obstruction, boundsDistance + 0.05f,
+                    Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore) &&
+                !candidate.OwnsCollider(obstruction.collider) &&
+                obstruction.distance < boundsDistance - 0.2f &&
+                !leafBounds.Intersects(obstruction.collider.bounds))
+                continue;
+
+            nearestDoorDistance = boundsDistance;
             door = candidate;
-            return true;
         }
 
-        door = null;
-        return false;
+        return door != null;
     }
 
-    private bool ContainsCameraPosition(Vector3 position)
+    private bool TryGetLeafBounds(out Bounds bounds)
     {
-        if (doorBlockers != null)
+        bool hasBounds = false;
+        bounds = default;
+        if (doorRenderers != null)
         {
-            foreach (Collider blocker in doorBlockers)
+            foreach (Renderer targetRenderer in doorRenderers)
             {
-                if (blocker != null && blocker.bounds.Contains(position))
-                    return true;
+                if (targetRenderer == null)
+                    continue;
+
+                if (hasBounds)
+                    bounds.Encapsulate(targetRenderer.bounds);
+                else
+                {
+                    bounds = targetRenderer.bounds;
+                    hasBounds = true;
+                }
             }
         }
 
-        if (doorRenderers == null)
-            return false;
-
-        foreach (Renderer targetRenderer in doorRenderers)
+        if (!hasBounds && doorBlockers != null)
         {
-            if (targetRenderer != null && targetRenderer.bounds.Contains(position))
-                return true;
+            foreach (Collider blocker in doorBlockers)
+            {
+                if (blocker == null)
+                    continue;
+
+                if (hasBounds)
+                    bounds.Encapsulate(blocker.bounds);
+                else
+                {
+                    bounds = blocker.bounds;
+                    hasBounds = true;
+                }
+            }
         }
 
-        return false;
+        return hasBounds;
     }
 
     private bool OwnsCollider(Collider collider)

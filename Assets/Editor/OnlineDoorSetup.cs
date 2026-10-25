@@ -10,6 +10,7 @@ public static class OnlineDoorSetup
 {
     private const string OnlineSceneName = "OnlineFirstFloor";
     private const string CollisionProxyRootName = "Online Collision Proxies";
+    private const string DoorGroupPrefix = "Door_Group.";
 
     [MenuItem("Tools/First Floor/Make Selected Door Networked")]
     private static void MakeSelectedDoorNetworked()
@@ -37,13 +38,82 @@ public static class OnlineDoorSetup
                 "Configure selected door", "Cancel"))
             return;
 
-        bool isNewDoor = door == null;
+        ConfigureDoor(selected);
+
+        EditorSceneManager.MarkSceneDirty(activeScene);
+        EditorUtility.SetDirty(selected);
+        Selection.activeGameObject = selected;
+        EditorUtility.DisplayDialog("Door configured",
+            "The selected door now has networked open/close control. Check the Inspector: assign or position a hinge pivot if needed, then save OnlineFirstFloor.",
+            "OK");
+    }
+
+    [MenuItem("Tools/First Floor/Configure All First-Floor Doors")]
+    private static void ConfigureAllDoors()
+    {
+        Scene activeScene = SceneManager.GetActiveScene();
+        if (!activeScene.name.Equals(OnlineSceneName, StringComparison.OrdinalIgnoreCase))
+        {
+            EditorUtility.DisplayDialog("Wrong scene",
+                "Open OnlineFirstFloor before configuring its doors.", "OK");
+            return;
+        }
+
+        Transform[] groups = activeScene.GetRootGameObjects()
+            .SelectMany(root => root.GetComponentsInChildren<Transform>(true))
+            .Where(candidate => candidate.name.StartsWith(DoorGroupPrefix, StringComparison.Ordinal))
+            .ToArray();
+        Transform[] doors = groups.Where(group => FindMovingLeaf(group.gameObject) != group).ToArray();
+        if (doors.Length == 0)
+        {
+            EditorUtility.DisplayDialog("No doors found",
+                "No Door_Group.* objects with a child named Door.* were found in OnlineFirstFloor.", "OK");
+            return;
+        }
+
+        if (!EditorUtility.DisplayDialog("Configure all first-floor doors",
+                $"Configure {doors.Length} Door_Group.* objects with a NetworkObject, NetworkLockedDoor, hinge, blockers, and handle-side opening angle?\n\n" +
+                "Handle on the door's local +X side: Euler (0, 0, -90).\n" +
+                "Handle on the door's local -X side: Euler (0, 0, 90).",
+                "Configure all", "Cancel"))
+            return;
+
+        Undo.IncrementCurrentGroup();
+        Undo.SetCurrentGroupName("Configure all first-floor doors");
+        int configured = 0;
+        int missingHinge = 0;
+        foreach (Transform group in doors)
+        {
+            Transform leaf = FindMovingLeaf(group.gameObject);
+            if (FindHingePivot(leaf) == null)
+            {
+                missingHinge++;
+                Debug.LogWarning($"[OnlineDoorSetup] No DoorHinge* found for {group.name}; configured its interaction but it will rotate around the leaf origin.", group.gameObject);
+            }
+
+            ConfigureDoor(group.gameObject);
+            configured++;
+        }
+
+        EditorSceneManager.MarkSceneDirty(activeScene);
+        Selection.objects = doors.Select(group => group.gameObject).ToArray();
+        EditorUtility.DisplayDialog("Doors configured",
+            $"Configured {configured} doors. {missingHinge} have no matching DoorHinge* pivot; inspect those hinges and save OnlineFirstFloor.",
+            "OK");
+    }
+
+    private static void ConfigureDoor(GameObject selected)
+    {
+        bool isNewDoor = selected.GetComponent<NetworkLockedDoor>() == null;
         Transform doorLeaf = FindMovingLeaf(selected);
         if (selected.GetComponent<NetworkObject>() == null)
             Undo.AddComponent<NetworkObject>(selected);
 
-        if (isNewDoor)
+        NetworkLockedDoor door = selected.GetComponent<NetworkLockedDoor>();
+        if (door == null)
             door = Undo.AddComponent<NetworkLockedDoor>(selected);
+        else
+            Undo.RecordObject(door, "Configure networked door");
 
         Collider[] blockers = FindDoorBlockers(doorLeaf);
         SerializedObject serializedDoor = new SerializedObject(door);
@@ -52,19 +122,57 @@ public static class OnlineDoorSetup
         serializedDoor.FindProperty("doorBlockers").arraySize = blockers.Length;
         for (int index = 0; index < blockers.Length; index++)
             serializedDoor.FindProperty("doorBlockers").GetArrayElementAtIndex(index).objectReferenceValue = blockers[index];
+        serializedDoor.FindProperty("openEulerAngles").vector3Value =
+            new Vector3(0f, 0f, HandleIsOnLocalRight(doorLeaf) ? -90f : 90f);
         if (isNewDoor)
         {
             serializedDoor.FindProperty("requiresTestKey").boolValue = false;
             serializedDoor.FindProperty("allowGranny").boolValue = true;
         }
         serializedDoor.ApplyModifiedProperties();
-
-        EditorSceneManager.MarkSceneDirty(activeScene);
         EditorUtility.SetDirty(selected);
-        Selection.activeGameObject = selected;
-        EditorUtility.DisplayDialog("Door configured",
-            "The selected door now has networked open/close control. Check the Inspector: assign or position a hinge pivot if needed, then save OnlineFirstFloor.",
-            "OK");
+        EditorUtility.SetDirty(door);
+    }
+
+    private static bool HandleIsOnLocalRight(Transform doorLeaf)
+    {
+        Transform[] handles = doorLeaf.GetComponentsInChildren<Transform>(true)
+            .Where(candidate => candidate.name.StartsWith("Handle", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        if (handles.Length == 0)
+        {
+            Debug.LogWarning($"[OnlineDoorSetup] No Handle* object found under {doorLeaf.name}; defaulting to local +X/right.", doorLeaf.gameObject);
+            return true;
+        }
+
+        float handleLocalX = handles.Average(handle => doorLeaf.InverseTransformPoint(handle.position).x);
+        bool hasDoorBounds = false;
+        Bounds localDoorBounds = default;
+        foreach (Renderer renderer in doorLeaf.GetComponentsInChildren<Renderer>(true))
+        {
+            if (renderer == null || renderer.transform.name.StartsWith("Handle", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            Bounds worldBounds = renderer.bounds;
+            for (int corner = 0; corner < 8; corner++)
+            {
+                Vector3 worldPoint = new Vector3(
+                    (corner & 1) == 0 ? worldBounds.min.x : worldBounds.max.x,
+                    (corner & 2) == 0 ? worldBounds.min.y : worldBounds.max.y,
+                    (corner & 4) == 0 ? worldBounds.min.z : worldBounds.max.z);
+                Vector3 localPoint = doorLeaf.InverseTransformPoint(worldPoint);
+                if (hasDoorBounds)
+                    localDoorBounds.Encapsulate(localPoint);
+                else
+                {
+                    localDoorBounds = new Bounds(localPoint, Vector3.zero);
+                    hasDoorBounds = true;
+                }
+            }
+        }
+
+        float doorCenterX = hasDoorBounds ? localDoorBounds.center.x : 0f;
+        return handleLocalX >= doorCenterX;
     }
 
     [MenuItem("Tools/First Floor/Make Selected Door Networked", true)]

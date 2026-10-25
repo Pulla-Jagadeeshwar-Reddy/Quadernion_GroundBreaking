@@ -85,7 +85,7 @@ public static class OnlineDoorSetup
         }
 
         if (!EditorUtility.DisplayDialog("Configure all first-floor doors",
-                $"Configure {doors.Length} Door_Group.* objects with a NetworkObject, NetworkLockedDoor, hinge, blockers, and opening angle (0, 0, -90) for every door?",
+                $"Configure {doors.Length} first-floor doors while keeping their existing hinges? Right-handle doors use (0, 0, -90); left-handle doors use (0, 0, 90) so they swing the opposite way.",
                 "Configure all", "Cancel"))
             return;
 
@@ -133,7 +133,8 @@ public static class OnlineDoorSetup
         serializedDoor.FindProperty("doorBlockers").arraySize = blockers.Length;
         for (int index = 0; index < blockers.Length; index++)
             serializedDoor.FindProperty("doorBlockers").GetArrayElementAtIndex(index).objectReferenceValue = blockers[index];
-        serializedDoor.FindProperty("openEulerAngles").vector3Value = new Vector3(0f, 0f, -90f);
+        serializedDoor.FindProperty("openEulerAngles").vector3Value =
+            new Vector3(0f, 0f, HandleIsOnLocalRight(doorLeaf) ? -90f : 90f);
         if (isNewDoor)
         {
             serializedDoor.FindProperty("requiresTestKey").boolValue = false;
@@ -246,6 +247,27 @@ public static class OnlineDoorSetup
         }
 
         return hasBounds;
+    }
+
+    private static bool HandleIsOnLocalRight(Transform doorLeaf)
+    {
+        Transform[] handles = doorLeaf.GetComponentsInChildren<Transform>(true)
+            .Where(candidate => candidate.name.StartsWith("Handle", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        if (handles.Length == 0)
+        {
+            Debug.LogWarning($"[OnlineDoorSetup] No Handle* object found under {doorLeaf.name}; defaulting to right-handle swing (-90).", doorLeaf.gameObject);
+            return true;
+        }
+
+        if (!TryGetDoorBoundsInLocalSpace(doorLeaf, out Bounds doorBounds))
+        {
+            Debug.LogWarning($"[OnlineDoorSetup] No door Renderer found under {doorLeaf.name}; defaulting to right-handle swing (-90).", doorLeaf.gameObject);
+            return true;
+        }
+
+        float handleLocalX = handles.Average(handle => doorLeaf.InverseTransformPoint(handle.position).x);
+        return handleLocalX >= doorBounds.center.x;
     }
 
     private static bool IsHandlePart(Transform candidate, Transform doorLeaf)

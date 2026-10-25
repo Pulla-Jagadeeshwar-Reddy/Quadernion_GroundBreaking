@@ -83,10 +83,10 @@ public static class OnlineDoorSetup
         foreach (Transform group in doors)
         {
             Transform leaf = FindMovingLeaf(group.gameObject);
-            if (FindHingePivot(leaf) == null)
+            if (FindOrCreateHingePivot(leaf) == null)
             {
                 missingHinge++;
-                Debug.LogWarning($"[OnlineDoorSetup] No DoorHinge* found for {group.name}; configured its interaction but it will rotate around the leaf origin.", group.gameObject);
+                Debug.LogWarning($"[OnlineDoorSetup] Could not create a hinge pivot for {group.name}; check that its door mesh has a Renderer.", group.gameObject);
             }
 
             ConfigureDoor(group.gameObject);
@@ -116,7 +116,7 @@ public static class OnlineDoorSetup
         Collider[] blockers = FindDoorBlockers(doorLeaf);
         SerializedObject serializedDoor = new SerializedObject(door);
         serializedDoor.FindProperty("doorLeaf").objectReferenceValue = doorLeaf;
-        serializedDoor.FindProperty("hingePivot").objectReferenceValue = FindHingePivot(doorLeaf);
+        serializedDoor.FindProperty("hingePivot").objectReferenceValue = FindOrCreateHingePivot(doorLeaf);
         serializedDoor.FindProperty("doorBlockers").arraySize = blockers.Length;
         for (int index = 0; index < blockers.Length; index++)
             serializedDoor.FindProperty("doorBlockers").GetArrayElementAtIndex(index).objectReferenceValue = blockers[index];
@@ -150,9 +150,6 @@ public static class OnlineDoorSetup
 
     private static Transform FindHingePivot(Transform doorLeaf)
     {
-        if (doorLeaf.parent == null)
-            return null;
-
         string suffix = doorLeaf.name.StartsWith("Door.", StringComparison.Ordinal)
             ? doorLeaf.name.Substring("Door".Length).Replace(".", "")
             : string.Empty;
@@ -160,8 +157,93 @@ public static class OnlineDoorSetup
             return null;
 
         string expectedName = "DoorHinge" + suffix;
-        return doorLeaf.parent.GetComponentsInChildren<Transform>(true)
+        Transform match = doorLeaf.parent != null
+            ? doorLeaf.parent.GetComponentsInChildren<Transform>(true)
+                .FirstOrDefault(candidate => candidate.name.Equals(expectedName, StringComparison.Ordinal))
+            : null;
+        if (match != null)
+            return match;
+
+        Scene scene = doorLeaf.gameObject.scene;
+        return scene.GetRootGameObjects()
+            .SelectMany(root => root.GetComponentsInChildren<Transform>(true))
             .FirstOrDefault(candidate => candidate.name.Equals(expectedName, StringComparison.Ordinal));
+    }
+
+    private static Transform FindOrCreateHingePivot(Transform doorLeaf)
+    {
+        Transform hinge = FindHingePivot(doorLeaf);
+        if (hinge != null)
+            return hinge;
+
+        string generatedName = "DoorHinge_Auto_" + doorLeaf.name;
+        Scene scene = doorLeaf.gameObject.scene;
+        hinge = scene.GetRootGameObjects()
+            .SelectMany(root => root.GetComponentsInChildren<Transform>(true))
+            .FirstOrDefault(candidate => candidate.name.Equals(generatedName, StringComparison.Ordinal));
+        if (hinge != null)
+            return hinge;
+
+        if (!TryGetDoorBoundsInLocalSpace(doorLeaf, out Bounds doorBounds))
+            return null;
+
+        Transform[] handles = doorLeaf.GetComponentsInChildren<Transform>(true)
+            .Where(candidate => candidate.name.StartsWith("Handle", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        float handleX = handles.Length > 0
+            ? handles.Average(handle => doorLeaf.InverseTransformPoint(handle.position).x)
+            : doorBounds.center.x + Mathf.Epsilon;
+        float hingeX = handleX >= doorBounds.center.x ? doorBounds.min.x : doorBounds.max.x;
+
+        var pivotObject = new GameObject(generatedName);
+        Undo.RegisterCreatedObjectUndo(pivotObject, "Create door hinge pivot");
+        if (pivotObject.scene != scene)
+            SceneManager.MoveGameObjectToScene(pivotObject, scene);
+        pivotObject.transform.SetPositionAndRotation(
+            doorLeaf.TransformPoint(new Vector3(hingeX, doorBounds.center.y, doorBounds.center.z)),
+            doorLeaf.rotation);
+        return pivotObject.transform;
+    }
+
+    private static bool TryGetDoorBoundsInLocalSpace(Transform doorLeaf, out Bounds bounds)
+    {
+        bool hasBounds = false;
+        bounds = default;
+        foreach (Renderer renderer in doorLeaf.GetComponentsInChildren<Renderer>(true))
+        {
+            if (renderer == null || IsHandlePart(renderer.transform, doorLeaf))
+                continue;
+
+            Bounds worldBounds = renderer.bounds;
+            for (int corner = 0; corner < 8; corner++)
+            {
+                Vector3 worldPoint = new Vector3(
+                    (corner & 1) == 0 ? worldBounds.min.x : worldBounds.max.x,
+                    (corner & 2) == 0 ? worldBounds.min.y : worldBounds.max.y,
+                    (corner & 4) == 0 ? worldBounds.min.z : worldBounds.max.z);
+                Vector3 localPoint = doorLeaf.InverseTransformPoint(worldPoint);
+                if (hasBounds)
+                    bounds.Encapsulate(localPoint);
+                else
+                {
+                    bounds = new Bounds(localPoint, Vector3.zero);
+                    hasBounds = true;
+                }
+            }
+        }
+
+        return hasBounds;
+    }
+
+    private static bool IsHandlePart(Transform candidate, Transform doorLeaf)
+    {
+        for (Transform current = candidate; current != null && current != doorLeaf; current = current.parent)
+        {
+            if (current.name.StartsWith("Handle", StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+
+        return false;
     }
 
     private static Collider[] FindDoorBlockers(Transform doorLeaf)

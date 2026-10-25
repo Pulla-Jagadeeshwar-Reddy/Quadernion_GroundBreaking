@@ -6,6 +6,7 @@ using UnityEngine;
 public class NetworkLockedDoor : NetworkBehaviour
 {
     private static readonly List<NetworkLockedDoor> SpawnedDoors = new();
+    private Renderer[] doorRenderers;
 
     [Header("Door motion")]
     [Tooltip("Assign the moving door leaf. Use Hinge Pivot for a separate hinge point; do not assign the stationary frame.")]
@@ -38,6 +39,8 @@ public class NetworkLockedDoor : NetworkBehaviour
     {
         if (doorLeaf == null)
             doorLeaf = transform;
+
+        doorRenderers = doorLeaf.GetComponentsInChildren<Renderer>(true);
 
         closedRotation = doorLeaf.localRotation;
         openRotation = closedRotation * Quaternion.Euler(openEulerAngles);
@@ -102,6 +105,54 @@ public class NetworkLockedDoor : NetworkBehaviour
         }
 
         door = null;
+        return false;
+    }
+
+    public static bool TryFindContainingCamera(Vector3 cameraPosition, Vector3 playerPosition, float maxDistance,
+        out NetworkLockedDoor door)
+    {
+        for (int index = SpawnedDoors.Count - 1; index >= 0; index--)
+        {
+            NetworkLockedDoor candidate = SpawnedDoors[index];
+            if (candidate == null || !candidate.IsSpawned)
+            {
+                SpawnedDoors.RemoveAt(index);
+                continue;
+            }
+
+            Vector3 doorPosition = candidate.doorLeaf != null ? candidate.doorLeaf.position : candidate.transform.position;
+            if (Vector3.Distance(playerPosition, doorPosition) > maxDistance ||
+                !candidate.ContainsCameraPosition(cameraPosition))
+                continue;
+
+            door = candidate;
+            return true;
+        }
+
+        door = null;
+        return false;
+    }
+
+    private bool ContainsCameraPosition(Vector3 position)
+    {
+        if (doorBlockers != null)
+        {
+            foreach (Collider blocker in doorBlockers)
+            {
+                if (blocker != null && blocker.bounds.Contains(position))
+                    return true;
+            }
+        }
+
+        if (doorRenderers == null)
+            return false;
+
+        foreach (Renderer targetRenderer in doorRenderers)
+        {
+            if (targetRenderer != null && targetRenderer.bounds.Contains(position))
+                return true;
+        }
+
         return false;
     }
 

@@ -47,6 +47,13 @@ public class NetworkInteractor : NetworkBehaviour
                 focusedExit = hit.collider.GetComponentInParent<NetworkEscapePoint>();
         }
 
+        // Physics.Raycast does not report a collider when the ray starts inside it.
+        // At point-blank range, use the assigned door bounds to retain door focus.
+        if (focusedPickup == null && focusedDoor == null &&
+            NetworkLockedDoor.TryFindContainingCamera(
+                viewCamera.transform.position, transform.position, interactionRange + 1f, out NetworkLockedDoor nearbyDoor))
+            focusedDoor = nearbyDoor;
+
         if (Keyboard.current != null && Keyboard.current.eKey.wasPressedThisFrame)
         {
             if (focusedPickup != null)

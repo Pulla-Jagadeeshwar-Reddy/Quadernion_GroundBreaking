@@ -20,7 +20,7 @@ public class NetworkLockedDoor : NetworkBehaviour
 
     [Header("Access")]
     [SerializeField] private bool requiresTestKey = true;
-    [SerializeField] private bool allowGranny = false;
+    [SerializeField] private bool allowGranny = true;
     [SerializeField] private float serverInteractionRange = 3.5f;
 
     public NetworkVariable<bool> IsOpen = new(
@@ -35,6 +35,7 @@ public class NetworkLockedDoor : NetworkBehaviour
     private Vector3 openWorldPosition;
     private Quaternion openWorldRotation;
     private bool isDuplicateComponent;
+    private bool isDuplicateLeaf;
 
     private void Awake()
     {
@@ -144,8 +145,20 @@ public class NetworkLockedDoor : NetworkBehaviour
 
     public override void OnNetworkSpawn()
     {
-        if (isDuplicateComponent)
+        if (isDuplicateComponent || doorLeaf == null)
             return;
+
+        // A duplicated scene object can accidentally point at another door's leaf.
+        // Let only one network behaviour animate and toggle a given leaf.
+        foreach (NetworkLockedDoor existing in SpawnedDoors)
+        {
+            if (existing == null || existing == this || existing.doorLeaf != doorLeaf)
+                continue;
+
+            isDuplicateLeaf = true;
+            Debug.LogWarning($"[{nameof(NetworkLockedDoor)}] {name} shares the door leaf '{doorLeaf.name}' with {existing.name}; this duplicate will be ignored.", this);
+            return;
+        }
 
         if (!SpawnedDoors.Contains(this))
             SpawnedDoors.Add(this);
@@ -168,7 +181,7 @@ public class NetworkLockedDoor : NetworkBehaviour
 
     public override void OnNetworkDespawn()
     {
-        if (isDuplicateComponent)
+        if (isDuplicateComponent || isDuplicateLeaf)
             return;
 
         IsOpen.OnValueChanged -= OnOpenChanged;
@@ -303,7 +316,7 @@ public class NetworkLockedDoor : NetworkBehaviour
 
     private void Update()
     {
-        if (isDuplicateComponent)
+        if (isDuplicateComponent || isDuplicateLeaf)
             return;
 
         if (hingePivot != null)
@@ -336,7 +349,7 @@ public class NetworkLockedDoor : NetworkBehaviour
 
     public string GetInteractionPrompt(NetworkPlayerController player, NetworkInventory inventory)
     {
-        if (isDuplicateComponent || !IsSpawned || player == null)
+        if (isDuplicateComponent || isDuplicateLeaf || !IsSpawned || player == null)
             return string.Empty;
 
         if (player.IsGranny && !allowGranny)
@@ -351,7 +364,7 @@ public class NetworkLockedDoor : NetworkBehaviour
     [Rpc(SendTo.Server, InvokePermission = RpcInvokePermission.Everyone)]
     public void InteractRpc(RpcParams rpcParams = default)
     {
-        if (isDuplicateComponent)
+        if (isDuplicateComponent || isDuplicateLeaf)
             return;
 
         ulong senderId = rpcParams.Receive.SenderClientId;
@@ -360,8 +373,15 @@ public class NetworkLockedDoor : NetworkBehaviour
             return;
 
         NetworkObject playerObject = client.PlayerObject;
-        Vector3 interactionPoint = doorLeaf != null ? doorLeaf.position : transform.position;
-        if (playerObject == null || Vector3.Distance(playerObject.transform.position, interactionPoint) > serverInteractionRange)
+        if (playerObject == null)
+            return;
+
+        Vector3 playerPosition = playerObject.transform.position;
+        float interactionDistance = Vector3.Distance(playerPosition,
+            doorLeaf != null ? doorLeaf.position : transform.position);
+        if (TryGetLeafBounds(out Bounds leafBounds))
+            interactionDistance = Vector3.Distance(playerPosition, leafBounds.ClosestPoint(playerPosition));
+        if (interactionDistance > serverInteractionRange)
             return;
 
         NetworkPlayerController role = playerObject.GetComponent<NetworkPlayerController>();

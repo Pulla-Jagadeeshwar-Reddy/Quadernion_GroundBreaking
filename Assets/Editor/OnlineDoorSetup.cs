@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using Unity.Netcode;
 using UnityEditor;
@@ -11,6 +12,29 @@ public static class OnlineDoorSetup
     private const string OnlineSceneName = "OnlineFirstFloor";
     private const string CollisionProxyRootName = "Online Collision Proxies";
     private const string DoorGroupPrefix = "Door_Group.";
+
+    private sealed class DoorwayCut
+    {
+        public int horizontalAxis;
+        public int verticalAxis;
+        public int depthAxis;
+        public float horizontalMin;
+        public float horizontalMax;
+        public float verticalMin;
+        public float verticalMax;
+    }
+
+    private readonly struct BoxSegment
+    {
+        public readonly Vector3 center;
+        public readonly Vector3 size;
+
+        public BoxSegment(Vector3 center, Vector3 size)
+        {
+            this.center = center;
+            this.size = size;
+        }
+    }
 
     [MenuItem("Tools/First Floor/Make Selected Door Networked")]
     private static void MakeSelectedDoorNetworked()
@@ -42,9 +66,17 @@ public static class OnlineDoorSetup
 
         EditorSceneManager.MarkSceneDirty(activeScene);
         EditorUtility.SetDirty(selected);
+        if (!EditorSceneManager.SaveScene(activeScene))
+        {
+            EditorUtility.DisplayDialog("Door save failed",
+                "The door was configured in memory, but OnlineFirstFloor could not be saved. Save the scene before building.",
+                "OK");
+            return;
+        }
+
         Selection.activeGameObject = selected;
         EditorUtility.DisplayDialog("Door configured",
-            "The selected door now has networked open/close control. Check the Inspector: assign or position a hinge pivot if needed, then save OnlineFirstFloor.",
+            "The selected door now has networked open/close control, and OnlineFirstFloor was saved. Check the Inspector and position the hinge pivot if needed.",
             "OK");
     }
 
@@ -114,10 +146,335 @@ public static class OnlineDoorSetup
         }
 
         EditorSceneManager.MarkSceneDirty(activeScene);
+        if (!EditorSceneManager.SaveScene(activeScene))
+        {
+            EditorUtility.DisplayDialog("Door save failed",
+                "The doors were configured in memory, but OnlineFirstFloor could not be saved. The build would use the previous saved scene.",
+                "OK");
+            return;
+        }
+
         Selection.objects = doors.Select(group => group.gameObject).ToArray();
         EditorUtility.DisplayDialog("Doors configured",
-            $"Configured {configured} doors: {rightHandleDoors} right-handle (-90), {leftHandleDoors} left-handle (+90). Removed {duplicateComponents} duplicate door components. {missingHinge} hinges could not be found or created. Save OnlineFirstFloor.",
+            $"Configured {configured} doors: {rightHandleDoors} right-handle (-90), {leftHandleDoors} left-handle (+90). Removed {duplicateComponents} duplicate door components. {missingHinge} hinges could not be found or created. OnlineFirstFloor was saved.",
             "OK");
+    }
+
+    [MenuItem("Tools/First Floor/Carve Doorway Collision Openings")]
+    private static void CarveDoorwayCollisionOpenings()
+    {
+        Scene scene = SceneManager.GetActiveScene();
+        bool isSupportedScene = scene.name.Equals(OnlineSceneName, StringComparison.OrdinalIgnoreCase) ||
+                                scene.name.IndexOf("RoomTraversalTest", StringComparison.OrdinalIgnoreCase) >= 0;
+        if (!isSupportedScene)
+        {
+            EditorUtility.DisplayDialog("Open a first-floor scene",
+                "Open OnlineFirstFloor or an OnlineFirstFloor_RoomTraversalTest copy before carving doorway collisions.", "OK");
+            return;
+        }
+
+        if (EditorApplication.isPlaying)
+        {
+            EditorUtility.DisplayDialog("Stop Play mode",
+                "Stop Play mode, then run this command again. Doorway collider changes must be made to the saved scene.", "OK");
+            return;
+        }
+
+        GameObject proxyRoot = GameObject.Find(CollisionProxyRootName);
+        if (proxyRoot == null)
+        {
+            EditorUtility.DisplayDialog("Collision proxies not found",
+                $"The Online Collision Proxies object is missing from {scene.name}.", "OK");
+            return;
+        }
+
+        NetworkLockedDoor[] doors = scene.GetRootGameObjects()
+            .SelectMany(root => root.GetComponentsInChildren<NetworkLockedDoor>(true))
+            .ToArray();
+        BoxCollider[] wallBoxes = proxyRoot.GetComponentsInChildren<BoxCollider>(true)
+            .Where(box => box != null && IsWallProxyName(box.name))
+            .ToArray();
+        var cutsByWall = new Dictionary<BoxCollider, List<DoorwayCut>>();
+        var seenDoorBlockers = new HashSet<int>();
+        var doorsWithoutWallCut = new List<string>();
+
+        foreach (NetworkLockedDoor door in doors)
+        {
+            bool foundWallCut = false;
+            SerializedObject serializedDoor = new SerializedObject(door);
+            SerializedProperty blockers = serializedDoor.FindProperty("doorBlockers");
+            if (blockers == null)
+            {
+                doorsWithoutWallCut.Add(door.name);
+                continue;
+            }
+
+            for (int blockerIndex = 0; blockerIndex < blockers.arraySize; blockerIndex++)
+            {
+                Collider collider = blockers.GetArrayElementAtIndex(blockerIndex).objectReferenceValue as Collider;
+                if (!(collider is BoxCollider doorBox) || !doorBox.name.StartsWith("Collision - Door", StringComparison.Ordinal) ||
+                    !seenDoorBlockers.Add(doorBox.GetInstanceID()))
+                    continue;
+
+                foreach (BoxCollider wall in wallBoxes)
+                {
+                    if (!TryCreateDoorwayCut(wall, doorBox, out DoorwayCut cut))
+                        continue;
+
+                    if (!cutsByWall.TryGetValue(wall, out List<DoorwayCut> cuts))
+                    {
+                        cuts = new List<DoorwayCut>();
+                        cutsByWall.Add(wall, cuts);
+                    }
+
+                    cuts.Add(cut);
+                    foundWallCut = true;
+                }
+            }
+
+            if (!foundWallCut)
+                doorsWithoutWallCut.Add(door.name);
+        }
+
+        if (cutsByWall.Count == 0)
+        {
+            EditorUtility.DisplayDialog("No doorway blockers found",
+                "No Plane/Floor collision proxy boxes overlapped any configured door blocker. Run Configure All First-Floor Doors first and check that the matching Collision - Door object is assigned in Door Blockers.", "OK");
+            return;
+        }
+
+        int openings = cutsByWall.Values.Sum(cuts => cuts.Count);
+        if (!EditorUtility.DisplayDialog("Carve doorway collision openings",
+                $"This will rebuild doorway cuts on {cutsByWall.Count} wall boxes for {openings} door-to-wall overlap(s), including previously carved walls. " +
+                "Old generated doorway segments on those walls will be replaced. The operation supports Undo.",
+                "Carve openings", "Cancel"))
+            return;
+
+        Undo.IncrementCurrentGroup();
+        Undo.SetCurrentGroupName("Carve doorway collision openings");
+        int segmentCount = 0;
+        foreach (KeyValuePair<BoxCollider, List<DoorwayCut>> entry in cutsByWall)
+        {
+            BoxCollider wall = entry.Key;
+            List<BoxSegment> segments = BuildSegments(wall, entry.Value);
+            BoxCollider[] oldSegments = wall.GetComponentsInChildren<BoxCollider>(true)
+                .Where(collider => collider != wall &&
+                                   collider.name.StartsWith("Doorway Collision Segment", StringComparison.Ordinal))
+                .ToArray();
+            foreach (BoxCollider oldSegment in oldSegments)
+                Undo.DestroyObjectImmediate(oldSegment.gameObject);
+
+            Undo.RecordObject(wall, "Replace doorway wall collision");
+            wall.enabled = false;
+
+            for (int index = 0; index < segments.Count; index++)
+            {
+                BoxSegment segment = segments[index];
+                var segmentObject = new GameObject($"Doorway Collision Segment {index + 1:00}");
+                Undo.RegisterCreatedObjectUndo(segmentObject, "Create doorway wall segment collider");
+                segmentObject.layer = wall.gameObject.layer;
+                segmentObject.isStatic = wall.gameObject.isStatic;
+                segmentObject.transform.SetParent(wall.transform, false);
+                segmentObject.transform.localPosition = segment.center;
+                segmentObject.transform.localRotation = Quaternion.identity;
+                segmentObject.transform.localScale = Vector3.one;
+                BoxCollider segmentCollider = segmentObject.AddComponent<BoxCollider>();
+                segmentCollider.size = segment.size;
+                segmentCount++;
+            }
+        }
+
+        EditorSceneManager.MarkSceneDirty(scene);
+        if (!EditorSceneManager.SaveScene(scene))
+        {
+            EditorUtility.DisplayDialog("Save failed",
+                "Doorway collision openings were created in memory but OnlineFirstFloor could not be saved. Use Undo if needed, then save the scene before building.",
+                "OK");
+            return;
+        }
+
+        Debug.Log($"[OnlineDoorSetup] Carved {openings} doorway openings through {cutsByWall.Count} wall proxies using {segmentCount} replacement colliders.");
+        EditorUtility.DisplayDialog("Doorway collisions updated",
+            $"Carved {openings} doorway openings through {cutsByWall.Count} wall collision proxies. Created {segmentCount} wall segments; OnlineFirstFloor was saved." +
+            (doorsWithoutWallCut.Count == 0
+                ? " Every configured door overlapped at least one wall proxy."
+                : " No wall proxy overlapped these doors: " + string.Join(", ", doorsWithoutWallCut) +
+                  ". Check their Door Blockers references or nearby collision meshes."),
+            "OK");
+    }
+
+    private static bool IsWallProxyName(string objectName)
+    {
+        return objectName.StartsWith("Collision - Plane", StringComparison.Ordinal) ||
+               objectName.StartsWith("Collision - Floor", StringComparison.Ordinal);
+    }
+
+    private static bool TryCreateDoorwayCut(BoxCollider wall, BoxCollider door, out DoorwayCut cut)
+    {
+        cut = null;
+        Transform wallTransform = wall.transform;
+        Transform doorTransform = door.transform;
+        Vector3 horizontal = wallTransform.InverseTransformDirection(doorTransform.right).normalized;
+        Vector3 vertical = wallTransform.InverseTransformDirection(doorTransform.forward).normalized;
+        Vector3 depth = wallTransform.InverseTransformDirection(doorTransform.up).normalized;
+        int horizontalAxis = DominantAxis(horizontal);
+        int verticalAxis = DominantAxis(vertical);
+        int depthAxis = DominantAxis(depth);
+        if (horizontalAxis == verticalAxis || horizontalAxis == depthAxis || verticalAxis == depthAxis ||
+            Mathf.Abs(Component(horizontal, horizontalAxis)) < 0.95f ||
+            Mathf.Abs(Component(vertical, verticalAxis)) < 0.95f ||
+            Mathf.Abs(Component(depth, depthAxis)) < 0.95f)
+            return false;
+
+        Vector3 center = wallTransform.InverseTransformPoint(doorTransform.TransformPoint(door.center));
+        Vector3 halfRight = wallTransform.InverseTransformVector(doorTransform.TransformVector(Vector3.right * door.size.x * 0.5f));
+        Vector3 halfUp = wallTransform.InverseTransformVector(doorTransform.TransformVector(Vector3.up * door.size.y * 0.5f));
+        Vector3 halfForward = wallTransform.InverseTransformVector(doorTransform.TransformVector(Vector3.forward * door.size.z * 0.5f));
+        Vector3 halfExtents = new Vector3(
+            Mathf.Abs(halfRight.x) + Mathf.Abs(halfUp.x) + Mathf.Abs(halfForward.x),
+            Mathf.Abs(halfRight.y) + Mathf.Abs(halfUp.y) + Mathf.Abs(halfForward.y),
+            Mathf.Abs(halfRight.z) + Mathf.Abs(halfUp.z) + Mathf.Abs(halfForward.z));
+
+        Vector3 wallMin = wall.center - wall.size * 0.5f;
+        Vector3 wallMax = wall.center + wall.size * 0.5f;
+        float clearance = 0.02f;
+        float wallHorizontalMin = Component(wallMin, horizontalAxis);
+        float wallHorizontalMax = Component(wallMax, horizontalAxis);
+        float wallVerticalMin = Component(wallMin, verticalAxis);
+        float wallVerticalMax = Component(wallMax, verticalAxis);
+        float wallDepthMin = Component(wallMin, depthAxis);
+        float wallDepthMax = Component(wallMax, depthAxis);
+
+        float doorHorizontalMin = Component(center, horizontalAxis) - Component(halfExtents, horizontalAxis) - clearance;
+        float doorHorizontalMax = Component(center, horizontalAxis) + Component(halfExtents, horizontalAxis) + clearance;
+        float doorVerticalMin = Component(center, verticalAxis) - Component(halfExtents, verticalAxis) - clearance;
+        float doorVerticalMax = Component(center, verticalAxis) + Component(halfExtents, verticalAxis) + clearance;
+        float doorDepthMin = Component(center, depthAxis) - Component(halfExtents, depthAxis);
+        float doorDepthMax = Component(center, depthAxis) + Component(halfExtents, depthAxis);
+
+        // A wall piece may end exactly at the doorway edge, so clamp the cut to its bounds
+        // instead of rejecting it. Only carve when the wall and opening overlap in all axes.
+        if (doorHorizontalMax <= wallHorizontalMin || doorHorizontalMin >= wallHorizontalMax ||
+            doorVerticalMax <= wallVerticalMin || doorVerticalMin >= wallVerticalMax ||
+            doorDepthMax < wallDepthMin || doorDepthMin > wallDepthMax)
+            return false;
+
+        float horizontalMin = Mathf.Max(doorHorizontalMin, wallHorizontalMin);
+        float horizontalMax = Mathf.Min(doorHorizontalMax, wallHorizontalMax);
+        float verticalMin = Mathf.Max(doorVerticalMin, wallVerticalMin);
+        float verticalMax = Mathf.Min(doorVerticalMax, wallVerticalMax);
+        if (horizontalMax - horizontalMin < 0.05f || verticalMax - verticalMin < 0.05f)
+            return false;
+
+        cut = new DoorwayCut
+        {
+            horizontalAxis = horizontalAxis,
+            verticalAxis = verticalAxis,
+            depthAxis = depthAxis,
+            horizontalMin = horizontalMin,
+            horizontalMax = horizontalMax,
+            verticalMin = verticalMin,
+            verticalMax = verticalMax
+        };
+        return true;
+    }
+
+    private static List<BoxSegment> BuildSegments(BoxCollider wall, List<DoorwayCut> cuts)
+    {
+        Vector3 minimum = wall.center - wall.size * 0.5f;
+        Vector3 maximum = wall.center + wall.size * 0.5f;
+        int horizontalAxis = cuts[0].horizontalAxis;
+        int verticalAxis = cuts[0].verticalAxis;
+        int depthAxis = cuts[0].depthAxis;
+        var horizontalBounds = new List<float> { Component(minimum, horizontalAxis), Component(maximum, horizontalAxis) };
+        foreach (DoorwayCut cut in cuts)
+        {
+            if (cut.horizontalAxis != horizontalAxis || cut.verticalAxis != verticalAxis || cut.depthAxis != depthAxis)
+                continue;
+            horizontalBounds.Add(cut.horizontalMin);
+            horizontalBounds.Add(cut.horizontalMax);
+        }
+        horizontalBounds = horizontalBounds.Distinct().OrderBy(value => value).ToList();
+
+        var segments = new List<BoxSegment>();
+        for (int index = 0; index < horizontalBounds.Count - 1; index++)
+        {
+            float left = horizontalBounds[index];
+            float right = horizontalBounds[index + 1];
+            if (right - left < 0.02f)
+                continue;
+
+            float midpoint = (left + right) * 0.5f;
+            List<(float min, float max)> openings = cuts
+                .Where(cut => cut.horizontalAxis == horizontalAxis && cut.verticalAxis == verticalAxis &&
+                              cut.depthAxis == depthAxis && midpoint > cut.horizontalMin && midpoint < cut.horizontalMax)
+                .Select(cut => (cut.verticalMin, cut.verticalMax))
+                .OrderBy(interval => interval.verticalMin)
+                .ToList();
+            var mergedOpenings = new List<(float min, float max)>();
+            foreach ((float min, float max) opening in openings)
+            {
+                if (mergedOpenings.Count == 0 || opening.min > mergedOpenings[^1].max)
+                    mergedOpenings.Add(opening);
+                else
+                    mergedOpenings[^1] = (mergedOpenings[^1].min, Mathf.Max(mergedOpenings[^1].max, opening.max));
+            }
+
+            float verticalCursor = Component(minimum, verticalAxis);
+            foreach ((float min, float max) opening in mergedOpenings)
+            {
+                AddSegment(segments, horizontalAxis, verticalAxis, depthAxis,
+                    left, right, verticalCursor, Mathf.Min(opening.min, Component(maximum, verticalAxis)),
+                    Component(minimum, depthAxis), Component(maximum, depthAxis));
+                verticalCursor = Mathf.Max(verticalCursor, opening.max);
+            }
+
+            AddSegment(segments, horizontalAxis, verticalAxis, depthAxis,
+                left, right, verticalCursor, Component(maximum, verticalAxis),
+                Component(minimum, depthAxis), Component(maximum, depthAxis));
+        }
+
+        return segments;
+    }
+
+    private static void AddSegment(List<BoxSegment> segments, int horizontalAxis, int verticalAxis, int depthAxis,
+        float horizontalMin, float horizontalMax, float verticalMin, float verticalMax, float depthMin, float depthMax)
+    {
+        if (horizontalMax - horizontalMin < 0.02f || verticalMax - verticalMin < 0.02f || depthMax - depthMin < 0.02f)
+            return;
+
+        Vector3 center = Vector3.zero;
+        Vector3 size = Vector3.zero;
+        SetComponent(ref center, horizontalAxis, (horizontalMin + horizontalMax) * 0.5f);
+        SetComponent(ref center, verticalAxis, (verticalMin + verticalMax) * 0.5f);
+        SetComponent(ref center, depthAxis, (depthMin + depthMax) * 0.5f);
+        SetComponent(ref size, horizontalAxis, horizontalMax - horizontalMin);
+        SetComponent(ref size, verticalAxis, verticalMax - verticalMin);
+        SetComponent(ref size, depthAxis, depthMax - depthMin);
+        segments.Add(new BoxSegment(center, size));
+    }
+
+    private static int DominantAxis(Vector3 value)
+    {
+        Vector3 absolute = new Vector3(Mathf.Abs(value.x), Mathf.Abs(value.y), Mathf.Abs(value.z));
+        if (absolute.x >= absolute.y && absolute.x >= absolute.z)
+            return 0;
+        return absolute.y >= absolute.z ? 1 : 2;
+    }
+
+    private static float Component(Vector3 value, int axis)
+    {
+        return axis == 0 ? value.x : axis == 1 ? value.y : value.z;
+    }
+
+    private static void SetComponent(ref Vector3 value, int axis, float component)
+    {
+        if (axis == 0)
+            value.x = component;
+        else if (axis == 1)
+            value.y = component;
+        else
+            value.z = component;
     }
 
     private static bool ConfigureDoor(GameObject selected)

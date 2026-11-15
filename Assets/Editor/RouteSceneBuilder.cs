@@ -199,13 +199,10 @@ public static class RouteSceneBuilder
         warnings.Add($"Walkable floor reachable from spawn: {grid.ReachableArea:0} m² ({grid.ReachableCells} cells).");
         File.WriteAllText(Path.Combine(Application.dataPath, "../Logs/reach_map.txt"), grid.Dump());
 
-        // Wooden boards: across sealed stairwells (built before the grid existed) and across
-        // door-sized openings into areas the player can see but never reach.
+        // Wooden boards across sealed stairwells (built before the grid existed).
         foreach ((Transform barrier, StairSpec stair) in pendingBoards)
             BoardUpStair(barrier, stair, materials);
         pendingBoards.Clear();
-        int boarded = BoardUpCutOffAreas(Child(root.transform, "Boarded Openings"), materials);
-        warnings.Add($"Boarded up {SealedStairs.Length} sealed stairwells and {boarded} openings into unreachable areas (see Logs/boarded.txt).");
 
         // The floor model's own desks, fans and windows (found by name, so a new model just works).
         List<EnvObject> envObjects = FindEnvObjects(root.transform);
@@ -223,6 +220,21 @@ public static class RouteSceneBuilder
         int spotCount = BuildSpawnPoints(Child(root.transform, "Spawn Points"), root.transform);
         if (janitorWarning != null)
             warnings.Add(janitorWarning);
+
+        // Dead-end rooms (behind one door, nothing any route needs) are boarded up, and their
+        // item spots and furniture interactions removed, so nobody wastes time in them.
+        HashSet<int> deadCells = BoardUpDeadEndRooms(Child(root.transform, "Boarded Rooms"), root.transform, materials, out int deadRooms);
+        int removedSpots = 0;
+        foreach (RouteSpawnPoint point in root.GetComponentsInChildren<RouteSpawnPoint>(true))
+        {
+            if (!grid.InCells(deadCells, point.transform.position, 1))
+                continue;
+            Object.DestroyImmediate(point.gameObject);
+            removedSpots++;
+        }
+        spotCount -= removedSpots;
+        envObjects.RemoveAll(env => grid.InCells(deadCells, new Vector3(env.Bounds.center.x, 0f, env.Bounds.center.z), 1));
+        warnings.Add($"Boarded up {SealedStairs.Length} sealed stairwells and {deadRooms} dead-end rooms ({removedSpots} item spots removed; see Logs/boarded.txt).");
 
         GameObject managerObject = Child(root.transform, "Route Manager").gameObject;
         managerObject.AddComponent<NetworkObject>();
@@ -1180,33 +1192,82 @@ public static class RouteSceneBuilder
     }
 
     /// <summary>
-    /// Finds door-sized openings between reachable floor and larger walkable areas the player can
-    /// never get into (rooms behind dead doors, cut-off corners) and boards them up. Long edges
-    /// such as railings are left alone. Writes Logs/boarded.txt.
+    /// A room behind a single working door, with nothing any route uses inside (no route props,
+    /// exits, PCs, benches, door lock rules or spawn markers), is a dead end: board the door from
+    /// the corridor side. Returns the boarded rooms' grid cells. Writes Logs/boarded.txt.
     /// </summary>
-    private static int BoardUpCutOffAreas(Transform parent, Materials materials)
+    private static HashSet<int> BoardUpDeadEndRooms(Transform parent, Transform contentRoot, Materials materials, out int count)
     {
+        count = 0;
+        HashSet<int> dead = new();
         if (grid == null)
-            return 0;
+            return dead;
 
-        List<(Vector3 center, Vector3 inward, float span)> openings = grid.FindCutOffOpenings(25, 0.6f, 3.2f);
-        System.Text.StringBuilder log = new();
-        int count = 0;
-        foreach ((Vector3 center, Vector3 inward, float span) in openings)
+        List<Vector3> important = new();
+        important.AddRange(contentRoot.GetComponentsInChildren<RouteInteractable>(true).Select(step => step.transform.position));
+        important.AddRange(contentRoot.GetComponentsInChildren<NetworkEscapePoint>(true).Select(exit => exit.transform.position));
+        important.AddRange(contentRoot.GetComponentsInChildren<DoorLockRule>(true).Select(rule => rule.transform.position));
+        foreach (string marker in new[] { "Player Spawn Marker", "Granny Spawn Marker" })
         {
-            // Never board the ladder route's atrium edge.
-            if (Vector3.Distance(Flat(center), Flat(LadderSpot)) < 4f || count >= 25)
+            GameObject spawn = GameObject.Find(marker);
+            if (spawn != null)
+                important.Add(spawn.transform.position);
+        }
+
+        Vector3[] lockRules = contentRoot.GetComponentsInChildren<DoorLockRule>(true).Select(rule => rule.transform.position).ToArray();
+        System.Text.StringBuilder log = new();
+        HashSet<Transform> leavesSeen = new();
+
+        foreach (NetworkLockedDoor door in Object.FindObjectsByType<NetworkLockedDoor>(FindObjectsInactive.Exclude))
+        {
+            if (!door.OpensWithoutTestKey || !door.TryGetEditorLeafBounds(out Bounds leaf, out Transform leafTransform) ||
+                !leavesSeen.Add(leafTransform))
+                continue;
+            if (lockRules.Any(rule => Vector3.Distance(Flat(rule), Flat(leaf.center)) < 2f))
                 continue;
 
-            Vector3 position = center + inward * 0.35f;
-            GameObject panel = BoardPanel($"Boarded Opening {count + 1}", position, -inward, span, materials, true);
+            bool thinX = leaf.size.x < leaf.size.z;
+            Vector3 normal = thinX ? Vector3.right : Vector3.forward;
+            Bounds blocked = new(leaf.center, new Vector3(thinX ? leaf.size.x + 0.6f : leaf.size.x + 0.2f, 10f,
+                thinX ? leaf.size.z + 0.2f : leaf.size.z + 0.6f));
+
+            HashSet<int> sideA = grid.FloodAround(leaf.center + normal * 0.8f, blocked, 1500);
+            HashSet<int> sideB = grid.FloodAround(leaf.center - normal * 0.8f, blocked, 1500);
+            if (sideA == null && sideB == null)
+                continue;
+            if (sideA != null && sideB != null && sideA.Overlaps(sideB))
+                continue;
+
+            // The smaller closed-off side is the room.
+            HashSet<int> room;
+            Vector3 corridorSide;
+            if (sideA != null && (sideB == null || sideA.Count <= sideB.Count))
+            {
+                room = sideA;
+                corridorSide = -normal;
+            }
+            else
+            {
+                room = sideB;
+                corridorSide = normal;
+            }
+
+            if (room.Count < 6 || important.Any(point => grid.InCells(room, point, 1)))
+                continue;
+
+            float width = thinX ? leaf.size.z : leaf.size.x;
+            float floorY = grid.TryNearestReachable(leaf.center + corridorSide * 0.8f, 1.5f, out Vector3 floor) ? floor.y : 0f;
+            Vector3 basePoint = new Vector3(leaf.center.x, floorY, leaf.center.z) + corridorSide * 0.22f;
+            GameObject panel = BoardPanel($"Boarded Room {count + 1}", basePoint, corridorSide, width + 0.3f, materials, true);
             panel.transform.SetParent(parent, true);
-            log.AppendLine($"{panel.name}: ({position.x:0.0}, {position.z:0.0}) span {span:0.0} m facing ({-inward.x:0.0}, {-inward.z:0.0})");
+            dead.UnionWith(room);
             count++;
+            log.AppendLine($"{panel.name}: door at ({leaf.center.x:0.0}, {leaf.center.z:0.0}), room {RoomVolume.NameAt(grid.CellPosition(room.First()))}, " +
+                           $"{room.Count * 0.16f:0} m² closed off");
         }
 
         File.WriteAllText(Path.Combine(Application.dataPath, "../Logs/boarded.txt"), log.ToString());
-        return count;
+        return dead;
     }
 
     private static GameObject Glow(Transform parent, Vector3 localPosition, Materials materials)
@@ -1542,154 +1603,65 @@ public static class RouteSceneBuilder
         }
 
         /// <summary>
-        /// Openings between reachable floor and walkable-but-unreachable regions of at least
-        /// <paramref name="minRegionCells"/> cells. Returns the reachable-side centre, the direction
-        /// into the cut-off area and the opening width, for widths in [minSpan, maxSpan].
+        /// Flood over reachable cells from the cell nearest <paramref name="from"/>, never entering
+        /// <paramref name="blocked"/> (XZ). Returns null when the flood grows past <paramref name="cap"/>
+        /// cells (open floor, not a room) or there is no start cell.
         /// </summary>
-        public List<(Vector3 center, Vector3 inward, float span)> FindCutOffOpenings(int minRegionCells, float minSpan, float maxSpan)
+        public HashSet<int> FloodAround(Vector3 from, Bounds blocked, int cap)
         {
-            int total = countX * countZ;
-            int[] region = new int[total];
-            List<int> regionSize = new() { 0 };
+            if (!TryCell(from, out int sx, out int sz))
+                return null;
+            int start = sx * countZ + sz;
+            if (!reachable[start])
+                return null;
+
+            HashSet<int> cells = new() { start };
             Queue<int> queue = new();
-            int[] dx4 = { 1, -1, 0, 0 };
-            int[] dz4 = { 0, 0, 1, -1 };
-
-            for (int start = 0; start < total; start++)
+            queue.Enqueue(start);
+            int[] dx = { 1, -1, 0, 0 };
+            int[] dz = { 0, 0, 1, -1 };
+            while (queue.Count > 0)
             {
-                if (!walkable[start] || reachable[start] || region[start] != 0)
-                    continue;
-
-                int label = regionSize.Count;
-                regionSize.Add(0);
-                region[start] = label;
-                queue.Enqueue(start);
-                while (queue.Count > 0)
+                int current = queue.Dequeue();
+                int cx = current / countZ, cz = current % countZ;
+                for (int d = 0; d < 4; d++)
                 {
-                    int current = queue.Dequeue();
-                    regionSize[label]++;
-                    int cx = current / countZ, cz = current % countZ;
-                    for (int d = 0; d < 4; d++)
-                    {
-                        int nx = cx + dx4[d], nz = cz + dz4[d];
-                        if (nx < 0 || nz < 0 || nx >= countX || nz >= countZ)
-                            continue;
-                        int next = nx * countZ + nz;
-                        if (!walkable[next] || reachable[next] || region[next] != 0)
-                            continue;
-                        region[next] = label;
-                        queue.Enqueue(next);
-                    }
-                }
-            }
-
-            // Reachable cells within 2 cells of a big cut-off region.
-            int[] frontier = new int[total];
-            for (int index = 0; index < total; index++)
-            {
-                if (!reachable[index])
-                    continue;
-                int cx = index / countZ, cz = index % countZ;
-                for (int ox = -2; ox <= 2 && frontier[index] == 0; ox++)
-                for (int oz = -2; oz <= 2; oz++)
-                {
-                    int nx = cx + ox, nz = cz + oz;
+                    int nx = cx + dx[d], nz = cz + dz[d];
                     if (nx < 0 || nz < 0 || nx >= countX || nz >= countZ)
                         continue;
                     int next = nx * countZ + nz;
-                    if (region[next] != 0 && regionSize[region[next]] >= minRegionCells)
-                    {
-                        frontier[index] = region[next];
-                        break;
-                    }
+                    if (!reachable[next] || cells.Contains(next))
+                        continue;
+                    Vector3 c = CellCenter(nx, nz);
+                    if (c.x > blocked.min.x && c.x < blocked.max.x && c.z > blocked.min.z && c.z < blocked.max.z)
+                        continue;
+                    cells.Add(next);
+                    if (cells.Count > cap)
+                        return null;
+                    queue.Enqueue(next);
                 }
             }
 
-            List<(Vector3, Vector3, float)> result = new();
-            bool[] seen = new bool[total];
-            for (int start = 0; start < total; start++)
-            {
-                if (frontier[start] == 0 || seen[start])
-                    continue;
-
-                int label = frontier[start];
-                List<int> cluster = new();
-                seen[start] = true;
-                queue.Enqueue(start);
-                while (queue.Count > 0)
-                {
-                    int current = queue.Dequeue();
-                    cluster.Add(current);
-                    int cx = current / countZ, cz = current % countZ;
-                    for (int ox = -1; ox <= 1; ox++)
-                    for (int oz = -1; oz <= 1; oz++)
-                    {
-                        int nx = cx + ox, nz = cz + oz;
-                        if (nx < 0 || nz < 0 || nx >= countX || nz >= countZ)
-                            continue;
-                        int next = nx * countZ + nz;
-                        if (seen[next] || frontier[next] != label)
-                            continue;
-                        seen[next] = true;
-                        queue.Enqueue(next);
-                    }
-                }
-
-                // Centre of the frontier, and of the cut-off cells right behind it.
-                Vector3 center = Vector3.zero;
-                float y = 0f;
-                foreach (int cell in cluster)
-                {
-                    center += CellCenter(cell / countZ, cell % countZ);
-                    y += floorY[cell];
-                }
-                center /= cluster.Count;
-                y /= cluster.Count;
-
-                Vector3 behind = Vector3.zero;
-                int behindCount = 0;
-                foreach (int cell in cluster)
-                {
-                    int cx = cell / countZ, cz = cell % countZ;
-                    for (int ox = -2; ox <= 2; ox++)
-                    for (int oz = -2; oz <= 2; oz++)
-                    {
-                        int nx = cx + ox, nz = cz + oz;
-                        if (nx < 0 || nz < 0 || nx >= countX || nz >= countZ)
-                            continue;
-                        if (region[nx * countZ + nz] != label)
-                            continue;
-                        behind += CellCenter(nx, nz);
-                        behindCount++;
-                    }
-                }
-
-                if (behindCount == 0)
-                    continue;
-                Vector3 inward = behind / behindCount - center;
-                inward.y = 0f;
-                if (inward.sqrMagnitude < 0.0001f)
-                    continue;
-                inward.Normalize();
-
-                Vector3 along = Vector3.Cross(Vector3.up, inward);
-                float min = float.MaxValue, max = float.MinValue;
-                foreach (int cell in cluster)
-                {
-                    float t = Vector3.Dot(CellCenter(cell / countZ, cell % countZ) - center, along);
-                    min = Mathf.Min(min, t);
-                    max = Mathf.Max(max, t);
-                }
-
-                float span = max - min + Cell;
-                if (span < minSpan || span > maxSpan)
-                    continue;
-
-                result.Add((new Vector3(center.x, y, center.z) + along * ((min + max) * 0.5f), inward, span));
-            }
-
-            return result;
+            return cells;
         }
+
+        /// <summary>Is the position's cell (or a cell within <paramref name="radius"/> cells) in the set?</summary>
+        public bool InCells(HashSet<int> cells, Vector3 position, int radius)
+        {
+            if (cells == null || cells.Count == 0 || !TryCell(position, out int x, out int z))
+                return false;
+            for (int ox = -radius; ox <= radius; ox++)
+            for (int oz = -radius; oz <= radius; oz++)
+            {
+                int nx = x + ox, nz = z + oz;
+                if (nx >= 0 && nz >= 0 && nx < countX && nz < countZ && cells.Contains(nx * countZ + nz))
+                    return true;
+            }
+
+            return false;
+        }
+
+        public Vector3 CellPosition(int index) => CellCenter(index / countZ, index % countZ);
 
         /// <summary>Debug: top-down map. 'o' reachable, '.' walkable but cut off, ' ' blocked/no floor.</summary>
         public string Dump()

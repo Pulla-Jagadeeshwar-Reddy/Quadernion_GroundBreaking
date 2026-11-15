@@ -591,6 +591,26 @@ public class NetworkLockedDoor : NetworkBehaviour, INetworkInteractable, ISecond
         return hasBounds;
     }
 
+    /// <summary>Leaf bounds from its renderers; works in the editor before Awake (route builder).</summary>
+    public bool TryGetEditorLeafBounds(out Bounds bounds, out Transform leaf)
+    {
+        leaf = doorLeaf != null ? doorLeaf : transform;
+        bounds = default;
+        bool has = false;
+        foreach (Renderer target in leaf.GetComponentsInChildren<Renderer>(true))
+        {
+            if (has)
+                bounds.Encapsulate(target.bounds);
+            else
+            {
+                bounds = target.bounds;
+                has = true;
+            }
+        }
+
+        return has;
+    }
+
     /// <summary>True when the Runner can open this door without the old test key (used by the route builder).</summary>
     public bool OpensWithoutTestKey => !requiresTestKey;
 

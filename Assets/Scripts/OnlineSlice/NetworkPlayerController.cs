@@ -35,8 +35,10 @@ public class NetworkPlayerController : NetworkBehaviour
         NetworkVariableReadPermission.Everyone,
         NetworkVariableWritePermission.Server);
 
-    public bool IsGranny => Unity.Netcode.NetworkManager.Singleton != null &&
-                            OwnerClientId == Unity.Netcode.NetworkManager.ServerClientId;
+    public bool IsGranny => LocalSinglePlayerMode.IsActive
+        ? LocalSinglePlayerMode.TestAsGranny
+        : Unity.Netcode.NetworkManager.Singleton != null &&
+          OwnerClientId == Unity.Netcode.NetworkManager.ServerClientId;
 
     private void Awake()
     {
@@ -50,6 +52,9 @@ public class NetworkPlayerController : NetworkBehaviour
     {
         MatchStarted.OnValueChanged += OnMatchStartedChanged;
         bool isLocalPlayer = IsOwner;
+
+        if (IsServer && LocalSinglePlayerMode.IsActive)
+            MatchStarted.Value = true;
 
         if (playerCamera != null)
         {
@@ -206,8 +211,6 @@ public class NetworkPlayerController : NetworkBehaviour
         Vector3 slideDisplacement = Vector3.ProjectOnPlane(remainingDisplacement, lastWallNormal);
         slideDisplacement.y = 0f;
 
-        // CharacterController usually slides by itself; this applies only residual movement
-        // that was blocked by a mesh edge or near-coplanar wall seam.
         if (slideDisplacement.sqrMagnitude > 0.000001f)
             characterController.Move(slideDisplacement);
     }

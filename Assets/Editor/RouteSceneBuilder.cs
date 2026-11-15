@@ -206,6 +206,27 @@ public static class RouteSceneBuilder
         // Doors that lead nowhere the player can go: boarded and locked for good.
         int deadDoors = BoardUpDeadDoors(Child(root.transform, "Boarded Doors"), materials);
 
+        // Hand-picked spots (Assets/Routes/extra_boards.json, positions from the in-game room label).
+        Transform extra = Child(root.transform, "Boarded Spots");
+        foreach (ExtraBoards.Spot spot in ExtraBoards.Load())
+        {
+            if (!string.IsNullOrEmpty(spot.kind) && spot.kind != "boards")
+                continue;
+            (Vector3 center, Vector3 facing, float width) = ExtraBoards.Fit(spot, out NetworkLockedDoor coveredDoor);
+            GameObject panel = BoardPanel($"Boarded Spot ({spot.x:0.#}, {spot.z:0.#})", center, facing, width, materials, true);
+            panel.transform.SetParent(extra, true);
+            if (coveredDoor != null && coveredDoor.TryGetEditorLeafBounds(out Bounds doorLeaf, out _))
+            {
+                // The door behind the boards stays shut.
+                GameObject rule = new($"Boarded Spot Lock ({spot.x:0.#}, {spot.z:0.#})");
+                rule.transform.SetParent(extra, false);
+                rule.transform.position = doorLeaf.center;
+                rule.AddComponent<DoorLockRule>().Configure(ItemIds.Boarded, 1.0f);
+            }
+            warnings.Add($"Boarded spot {spot.note} at ({center.x:0.0}, {center.z:0.0}), {width:0.0} m wide.");
+        }
+        Physics.SyncTransforms();
+
         // The floor model's own desks, fans and windows (found by name, so a new model just works).
         List<EnvObject> envObjects = FindEnvObjects(root.transform);
         benchCandidates.Clear();
@@ -523,15 +544,60 @@ public static class RouteSceneBuilder
         }
 
         RouteInteractable chain = NewStep(parent, "R5_ChainLock", LiftSpot, warnings);
+
+        // Service lift against the nearest wall: frame, two steel doors, a LIFT sign and a call
+        // button; the chain hangs across the doors, and the doors open when it comes off.
+        Vector3 liftBase = chain.transform.position;
+        Vector3 toWall = Vector3.back;
+        float wallDistance = float.MaxValue;
+        foreach (Vector3 direction in new[] { Vector3.forward, Vector3.back, Vector3.left, Vector3.right })
+        {
+            if (Physics.Raycast(liftBase + Vector3.up, direction, out RaycastHit wallHit, 3f, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore) &&
+                wallHit.distance < wallDistance)
+            {
+                wallDistance = wallHit.distance;
+                toWall = direction;
+            }
+        }
+
+        if (wallDistance < float.MaxValue)
+            chain.transform.position = liftBase + toWall * (wallDistance - 0.35f);
+        chain.transform.rotation = Quaternion.LookRotation(-toWall, Vector3.up);   // faces the room
+
+        GameObject lift = new("Service Lift");
+        lift.transform.SetParent(chain.transform, false);
+        lift.transform.localPosition = new Vector3(0f, 0f, -0.3f);                 // flush with the wall
+        void LiftPart(string partName, Vector3 size, Vector3 position, Material material)
+        {
+            GameObject part = Box(partName, size, position, material);
+            part.transform.SetParent(lift.transform, false);
+            Object.DestroyImmediate(part.GetComponent<Collider>());
+        }
+
+        LiftPart("Shaft", new Vector3(1.8f, 2.3f, 0.1f), new Vector3(0f, 1.15f, -0.15f), materials.DarkMetal);
+        LiftPart("Frame L", new Vector3(0.15f, 2.45f, 0.2f), new Vector3(-0.98f, 1.22f, 0f), materials.Metal);
+        LiftPart("Frame R", new Vector3(0.15f, 2.45f, 0.2f), new Vector3(0.98f, 1.22f, 0f), materials.Metal);
+        LiftPart("Frame Top", new Vector3(2.1f, 0.2f, 0.2f), new Vector3(0f, 2.4f, 0f), materials.Metal);
+        LiftPart("Sign", new Vector3(0.7f, 0.2f, 0.04f), new Vector3(0f, 2.68f, 0.05f), materials.Hazard);
+        LiftPart("Call Button", new Vector3(0.14f, 0.28f, 0.04f), new Vector3(1.25f, 1.15f, 0.02f), materials.Brass);
+        GameObject doorLeft = Box("Door L", new Vector3(0.88f, 2.25f, 0.06f), new Vector3(-0.45f, 1.13f, 0.02f), materials.Metal);
+        GameObject doorRight = Box("Door R", new Vector3(0.88f, 2.25f, 0.06f), new Vector3(0.45f, 1.13f, 0.02f), materials.Metal);
+        foreach (GameObject door in new[] { doorLeft, doorRight })
+        {
+            door.transform.SetParent(lift.transform, false);
+            Object.DestroyImmediate(door.GetComponent<Collider>());
+        }
+
         GameObject chainVisual = AddModel(chain.transform, "Route05_FrozenKey", "R5_ChainLock",
             () => Box("Chain", new Vector3(1.2f, 1.6f, 0.15f), new Vector3(0f, 1.0f, 0f), materials.Metal));
+        chainVisual.transform.localPosition = new Vector3(0f, 0f, 0.05f);
         EnsureCollider(chainVisual);
         chain.Configure("R5_ChainLock", route, "Lift Chain", "Unlock", 6f, 1, false, NoiseLevel.Small, NoiseLevel.None,
             null, Items((ItemIds.R5BellKey, 1)), Items((ItemIds.R5BellKey, 1)), null);
-        chain.ConfigureVisuals(null, new[] { chainVisual }, null, null, null);
+        chain.ConfigureVisuals(null, new[] { chainVisual, doorLeft, doorRight }, null, null, null);
 
-        BuildExit(parent, "Exit - Frozen Key", LiftSpot + new Vector3(-0.9f, 0f, 1.2f), route, new[] { chain },
-            "Service lift: chained shut", materials);
+        BuildExit(parent, "Exit - Frozen Key", chain.transform.position + chain.transform.forward * 0.3f, route, new[] { chain },
+            "Service lift: chained shut", materials, ladderExit: true);
     }
 
     // ------------------------------------------------------------------ floor-model furniture
@@ -1136,8 +1202,12 @@ public static class RouteSceneBuilder
         BoxCollider blocker = barrier.AddComponent<BoxCollider>();
         blocker.size = stair.Size;
 
-        List<(Vector3 center, Vector3 facing, float width)> placements = StairBlockerStore.TryGet(name, out var saved)
-            ? saved
+        string spotKind = kind == StairBlock.GoldDoor ? "gold" : kind == StairBlock.Shutter ? "shutter" : null;
+        List<(Vector3 center, Vector3 facing, float width)> listed = spotKind == null ? new()
+            : ExtraBoards.Load().Where(spot => spot.kind == spotKind).Select(ExtraBoards.Fit)
+                .ToList();
+        List<(Vector3 center, Vector3 facing, float width)> placements = listed.Count > 0 ? listed
+            : StairBlockerStore.TryGet(name, out var saved) ? saved
             : FindStairEntrances(stair);
         foreach ((Vector3 center, Vector3 facing, float width) in placements)
         {

@@ -81,6 +81,24 @@ public class RelayConnectionUI : MonoBehaviour
         }
 
         bool matchStarted = localPlayer != null && localPlayer.MatchStarted.Value;
+
+        // During a match the panel stays out of the way (it covered the room label); press Esc
+        // (cursor unlocked) to bring up a small one at the top centre with the Disconnect button.
+        if (matchStarted)
+        {
+            if (Cursor.lockState == CursorLockMode.Locked)
+                return;
+
+            Rect panel = new(Screen.width * 0.5f - 160f, 10f, 320f, 64f);
+            GUI.Box(panel, LocalSinglePlayerMode.IsActive
+                ? $"Local solo test: {(localPlayer.IsGranny ? "Granny" : "Player")}"
+                : (localPlayer.IsGranny ? "Online match: you are Granny" : "Online match: you are the Runner") +
+                  (string.IsNullOrEmpty(joinCode) ? "" : $"  ({joinCode})"));
+            if (GUI.Button(new Rect(panel.x + 92f, panel.y + 30f, 136f, 26f), "Disconnect"))
+                Disconnect();
+            return;
+        }
+
         float height = matchStarted ? 150f : 285f;
         GUI.Box(new Rect(10f, 10f, 390f, height), matchStarted ? "Online Match" : "Pre-game Lobby — 1 Granny vs 1 Runner");
 

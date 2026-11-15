@@ -29,7 +29,8 @@ public static class StairShots
         foreach (Transform t in Object.FindObjectsByType<Transform>(FindObjectsInactive.Exclude))
         {
             string n = t.name;
-            if (!(n.StartsWith("Barrier - ") || n == "Gold Stair Door" || n == "R2_Shutter (blocker)"))
+            if (!(n.StartsWith("Barrier - ") || n == "Gold Stair Door" || n == "R2_Shutter (blocker)" ||
+                  n == "Boarded Spots" || n == "R5_ChainLock"))
                 continue;
 
             Vector3 center = t.position;
@@ -50,7 +51,7 @@ public static class StairShots
                 if (child.GetComponentInChildren<Renderer>() == null)
                     continue;
                 // Blockers face the stairs, so the player stands on the other side.
-                Vector3 eye = child.position - child.forward * 3.5f + Vector3.up * 1.45f;
+                Vector3 eye = child.position + (n == "R5_ChainLock" ? child.forward : -child.forward) * 3.5f + Vector3.up * 1.45f;
                 cam.orthographic = false;
                 cam.fieldOfView = 65f;
                 cam.farClipPlane = 60f;

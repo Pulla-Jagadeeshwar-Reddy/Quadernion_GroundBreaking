@@ -273,6 +273,10 @@ public class NetworkInteractor : NetworkBehaviour
 
     private void DrawMatchHud()
     {
+        // Where am I: room name and floor position, top-left (handy for reporting spots).
+        Vector3 here = transform.position;
+        GUI.Box(new Rect(12f, 12f, 260f, 26f), $"{RoomVolume.NameAt(here)}   ({here.x:0}, {here.z:0})");
+
         RouteManager routes = RouteManager.Instance;
         const float width = 380f;
         float x = Screen.width - width - 16f;

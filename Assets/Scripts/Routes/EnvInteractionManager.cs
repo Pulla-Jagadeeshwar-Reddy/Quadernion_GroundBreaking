@@ -110,9 +110,9 @@ public class EnvInteractionManager : NetworkBehaviour
 
         contents.Clear();
         holds.Clear();
-        // Desks start closed; only desks that hide an item plus a few empty decoys are searchable.
+        // Every desk can be searched; only some hide an item.
         for (int index = 0; index < states.Count; index++)
-            states[index] = spots[index].kind == EnvKind.Desk ? (byte)3 : (byte)0;
+            states[index] = 0;
         HiddenCount.Value = 0;
         HiddenRooms.Value = default;
         NextDistractTime.Value = 0d;

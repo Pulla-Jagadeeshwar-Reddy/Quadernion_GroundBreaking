@@ -187,6 +187,11 @@ public static class RouteSceneBuilder
         // Permanent barriers on stairs that are not an exit.
         if (!DetectStairwells(warnings))
             return "No stair collision found (Collision - Stairs*); route content was not built.";
+        // A first walk of the floor (stairs open) tells which stairwell sides players can reach,
+        // so the boards go across every real entrance.
+        Physics.SyncTransforms();
+        grid = WalkGrid.Build(root.transform);
+        stairLog.Clear();
         Transform barriers = Child(root.transform, "Stair Barriers");
         foreach (StairSpec stair in SealedStairs)
             BuildStairBarrier(barriers, stair, materials, "Barrier - " + stair.Name);
@@ -1131,33 +1136,81 @@ public static class RouteSceneBuilder
         BoxCollider blocker = barrier.AddComponent<BoxCollider>();
         blocker.size = stair.Size;
 
-        (Vector3 center, Vector3 facing, float width) = FindStairEntrance(stair);
-        GameObject visual = kind switch
+        List<(Vector3 center, Vector3 facing, float width)> placements = StairBlockerStore.TryGet(name, out var saved)
+            ? saved
+            : FindStairEntrances(stair);
+        foreach ((Vector3 center, Vector3 facing, float width) in placements)
         {
-            StairBlock.Shutter => ShutterPanel(center, facing, width, materials),
-            StairBlock.GoldDoor => GoldDoorPanel(center, facing, width, materials),
-            _ => BoardPanel("Boards", center, facing, width, materials, true),
-        };
-        visual.transform.SetParent(barrier.transform, true);
+            GameObject visual = kind switch
+            {
+                StairBlock.Shutter => ShutterPanel(center, facing, width, materials),
+                StairBlock.GoldDoor => GoldDoorPanel(center, facing, width, materials),
+                _ => BoardPanel("Boards", center, facing, width, materials, true),
+            };
+            visual.transform.SetParent(barrier.transform, true);
+            stairLog.AppendLine($"{name}: {kind} at ({center.x:0.0}, {center.z:0.0}) width {width:0.0} m facing ({facing.x:0}, {facing.z:0})");
+        }
+
+        File.WriteAllText(Path.Combine(Application.dataPath, "../Logs/stair_blocks.txt"), stairLog.ToString());
         return barrier;
     }
 
+    private static readonly System.Text.StringBuilder stairLog = new();
+
     /// <summary>
-    /// The open side of a stairwell (the side whose view goes furthest before a wall), then out along
-    /// the passage until it widens: that mouth is where the blocker goes. Returns its floor centre,
-    /// the direction facing back toward the stairs, and its width.
+    /// Every side of a stairwell that players can walk up to (from the walk grid; the most open side
+    /// when there is no grid), each followed out along its passage until it widens: those mouths are
+    /// where blockers go. Returns floor centre, direction facing the stairs, and width per entrance.
     /// </summary>
-    private static (Vector3 center, Vector3 facing, float width) FindStairEntrance(StairSpec stair)
+    private static List<(Vector3 center, Vector3 facing, float width)> FindStairEntrances(StairSpec stair)
     {
+        List<(Vector3 center, Vector3 facing, float width)> result = new();
         Physics.SyncTransforms();
+        var sides = StairSides(stair);
+        foreach (int side in StairEntranceSides(stair))
+        {
+            Vector3 across = Vector3.Cross(Vector3.up, sides[side].outward) * (sides[side].length * 0.5f);
+            Vector3 a = sides[side].point - across, b = sides[side].point + across;
+            // Right in front of the stairs on this side (reliable on every layout); move a blocker by
+            // hand and use Tools/Routes/Save Stair Blocker Positions to put it somewhere else.
+            float floorY = Physics.Raycast(new Vector3(sides[side].point.x, 1f, sides[side].point.z), Vector3.down, out RaycastHit hit, 2f,
+                Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore) ? hit.point.y : 0f;
+            (Vector3 center, Vector3 facing, float width) mouth =
+                (new Vector3(sides[side].point.x, floorY, sides[side].point.z), -sides[side].outward, sides[side].length);
+            if (result.All(other => Vector3.Distance(Flat(other.center), Flat(mouth.center)) > 1f))
+                result.Add(mouth);
+        }
+
+        return result;
+    }
+
+    private static (Vector3 point, Vector3 outward, float length)[] StairSides(StairSpec stair)
+    {
         const float pad = 0.25f;
-        (Vector3 point, Vector3 outward, float length)[] sides =
+        return new[]
         {
             (new Vector3(stair.MaxX + pad, 1f, (stair.MinZ + stair.MaxZ) * 0.5f), Vector3.right, stair.MaxZ - stair.MinZ + 0.4f),
             (new Vector3(stair.MinX - pad, 1f, (stair.MinZ + stair.MaxZ) * 0.5f), Vector3.left, stair.MaxZ - stair.MinZ + 0.4f),
             (new Vector3((stair.MinX + stair.MaxX) * 0.5f, 1f, stair.MaxZ + pad), Vector3.forward, stair.MaxX - stair.MinX + 0.4f),
             (new Vector3((stair.MinX + stair.MaxX) * 0.5f, 1f, stair.MinZ - pad), Vector3.back, stair.MaxX - stair.MinX + 0.4f),
         };
+    }
+
+    private static List<int> StairEntranceSides(StairSpec stair)
+    {
+        var sides = StairSides(stair);
+        List<int> reachable = new();
+        for (int index = 0; index < sides.Length; index++)
+        {
+            Vector3 probe = sides[index].point + sides[index].outward * 0.4f;
+            bool walled = Physics.Raycast(sides[index].point - sides[index].outward * 0.35f, sides[index].outward, 0.9f,
+                Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
+            if (!walled && ReachDistance(new Vector3(probe.x, 0f, probe.z)) <= 0.7f)
+                reachable.Add(index);
+        }
+
+        if (reachable.Count > 0)
+            return reachable;
 
         int open = 0;
         float bestRun = -1f;
@@ -1172,30 +1225,74 @@ public static class RouteSceneBuilder
             }
         }
 
-        Vector3 start = sides[open].point;
+        return new List<int> { open };
+    }
+
+    /// <summary>
+    /// From one stairwell side, follow the stair passage outward:
+    /// - an opening in one side wall (the usual case: a short landing with a doorway off it) gets the
+    ///   blocker across that opening;
+    /// - the passage opening onto a wide area gets the blocker across the passage end;
+    /// - a stairwell that opens straight onto a wide area gets it across the stair side.
+    /// </summary>
+    private static (Vector3 center, Vector3 facing, float width) FindStairEntrance(StairSpec stair, int open)
+    {
+        var sides = StairSides(stair);
+        Vector3 start = sides[open].point;                  // y = 1 m, middle of the side
         Vector3 outward = sides[open].outward;
         Vector3 across = Vector3.Cross(Vector3.up, outward);
-        Vector3 center = new(start.x, 0f, start.z);
-        float width = sides[open].length;
-        const float wide = 3.2f;
+        float sideLength = sides[open].length;
 
-        for (float d = 0.2f; d <= 10f; d += 0.2f)
+        static float Ray(Vector3 from, Vector3 direction, float max = 8f) =>
+            Physics.Raycast(from, direction, out RaycastHit hit, max, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore)
+                ? hit.distance : max;
+
+        (Vector3, Vector3, float) Result(Vector3 center, Vector3 facing, float width)
         {
-            Vector3 probe = start + outward * d;
-            float left = Physics.Raycast(probe, -across, out RaycastHit l, 6f, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore) ? l.distance : 6f;
-            float right = Physics.Raycast(probe, across, out RaycastHit r, 6f, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore) ? r.distance : 6f;
-            if (left + right > wide)
-                break;                                    // the passage opens up here
-
-            center = probe + across * ((right - left) * 0.5f);
-            width = left + right;
-            if (Physics.Raycast(probe, outward, 0.25f, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore))
-                break;                                    // passage turns or ends at a door
+            float floorY = Physics.Raycast(new Vector3(center.x, 1f, center.z), Vector3.down, out RaycastHit floor, 2f,
+                Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore) ? floor.point.y : 0f;
+            return (new Vector3(center.x, floorY, center.z), facing, Mathf.Clamp(width, 0.8f, 6f));
         }
 
-        float floorY = Physics.Raycast(new Vector3(center.x, 1f, center.z), Vector3.down, out RaycastHit floor, 2f,
-            Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore) ? floor.point.y : 0f;
-        return (new Vector3(center.x, floorY, center.z), -outward, Mathf.Clamp(width, 0.8f, Mathf.Max(wide, sides[open].length)));
+        float l0 = Ray(start, -across), r0 = Ray(start, across);
+        if (l0 + r0 > sideLength + 1.5f)
+            return Result(start, -outward, sideLength);      // opens straight onto a wide area
+
+        const float step = 0.2f;
+        Vector3 lastCenter = start + across * ((r0 - l0) * 0.5f);
+        float lastWidth = l0 + r0;
+        for (float d = step; d <= 12f; d += step)
+        {
+            Vector3 probe = start + outward * d;
+            float l = Ray(probe, -across), r = Ray(probe, across);
+            bool leftOpen = l > l0 + 1.0f, rightOpen = r > r0 + 1.0f;
+            if (leftOpen && rightOpen)
+                return Result(lastCenter, -outward, lastWidth);
+
+            if (leftOpen || rightOpen)
+            {
+                Vector3 sideDir = rightOpen ? across : -across;
+                float wall = rightOpen ? r0 : l0;
+                float endD = d;
+                for (float e = d + step; e <= d + 6f; e += step)
+                {
+                    if (Ray(start + outward * e, sideDir) <= wall + 1.0f)
+                        break;
+                    endD = e;
+                }
+
+                float mid = (d + endD) * 0.5f;
+                return Result(start + outward * mid + sideDir * wall, -sideDir, endD - d + step + 0.3f);
+            }
+
+            if (Ray(probe, outward, 0.25f) < 0.25f)
+                break;                                         // dead end with no opening
+
+            lastCenter = probe + across * ((r - l) * 0.5f);
+            lastWidth = l + r;
+        }
+
+        return Result(start, -outward, sideLength);
     }
 
     private static GameObject ShutterPanel(Vector3 center, Vector3 facing, float width, Materials materials)
@@ -1229,21 +1326,21 @@ public static class RouteSceneBuilder
         Part("Frame R", new Vector3(0.1f, 2.2f, 0.16f), new Vector3(width * 0.5f - 0.05f, 1.1f, 0f), materials.WoodDark);
         Part("Frame Top", new Vector3(width, 0.12f, 0.16f), new Vector3(0f, 2.16f, 0f), materials.WoodDark);
         Part("Door", new Vector3(width - 0.2f, 2.08f, 0.06f), new Vector3(0f, 1.04f, 0f), materials.GoldDoor);
-        Part("Key Sign", new Vector3(0.34f, 0.18f, 0.02f), new Vector3(0f, 1.7f, 0.045f), materials.Brass);
+        Part("Key Sign", new Vector3(0.34f, 0.18f, 0.02f), new Vector3(0f, 1.7f, -0.045f), materials.Brass);
         for (int index = 0; index < 3; index++)
         {
             GameObject plank = Box($"Plank {index + 1}", new Vector3(width + 0.1f, 0.16f, 0.04f),
-                new Vector3(0f, 0.6f + index * 0.45f, 0.06f), materials.Wood);
+                new Vector3(0f, 0.6f + index * 0.45f, -0.06f), materials.Wood);
             plank.transform.localRotation = Quaternion.Euler(0f, 0f, index % 2 == 0 ? 6f : -5f);
             plank.transform.SetParent(root.transform, false);
             Object.DestroyImmediate(plank.GetComponent<Collider>());
         }
 
-        Part("Padlock", new Vector3(0.12f, 0.14f, 0.06f), new Vector3(width * 0.25f, 1.05f, 0.1f), materials.Brass);
-        Part("Shackle", new Vector3(0.08f, 0.08f, 0.02f), new Vector3(width * 0.25f, 1.15f, 0.1f), materials.Metal);
+        Part("Padlock", new Vector3(0.12f, 0.14f, 0.06f), new Vector3(width * 0.25f, 1.05f, -0.1f), materials.Brass);
+        Part("Shackle", new Vector3(0.08f, 0.08f, 0.02f), new Vector3(width * 0.25f, 1.15f, -0.1f), materials.Metal);
 
         BoxCollider blocker = root.AddComponent<BoxCollider>();
-        blocker.center = new Vector3(0f, 1.1f, 0.03f);
+        blocker.center = new Vector3(0f, 1.1f, -0.03f);
         blocker.size = new Vector3(width, 2.2f, 0.25f);
         return root;
     }
@@ -1679,6 +1776,135 @@ public static class RouteSceneBuilder
                 }
             }
         }
+
+        /// <summary>
+        /// The entrance of a stair passage. Spreads over reachable floor from the cells along the
+        /// stairwell side (a-b) in 0.4 m distance bands; each band's size is the passage width there.
+        /// The mouth is the last narrow band before the floor opens up (or a doorway, which is the
+        /// narrowest band). Returns its floor centre, the direction toward the stairs and its width.
+        /// </summary>
+        public bool FindMouth(Vector3 a, Vector3 b, out Vector3 center, out Vector3 towardStairs, out float width)
+        {
+            center = default;
+            towardStairs = default;
+            width = 0f;
+            int total = countX * countZ;
+            int[] dist = new int[total];
+            for (int i = 0; i < total; i++)
+                dist[i] = -1;
+
+            Queue<int> queue = new();
+            Vector2 a2 = new(a.x, a.z), b2 = new(b.x, b.z);
+            for (int x = 0; x < countX; x++)
+            for (int z = 0; z < countZ; z++)
+            {
+                int index = x * countZ + z;
+                if (!reachable[index])
+                    continue;
+                Vector3 c = CellCenter(x, z);
+                Vector2 p = new(c.x, c.z);
+                Vector2 ab = b2 - a2;
+                float t = Mathf.Clamp01(Vector2.Dot(p - a2, ab) / Mathf.Max(0.0001f, ab.sqrMagnitude));
+                if (Vector2.Distance(p, a2 + ab * t) > 0.6f)
+                    continue;
+                dist[index] = 0;
+                queue.Enqueue(index);
+            }
+
+            if (queue.Count == 0)
+                return false;
+
+            List<List<int>> bands = new();
+            int visited = 0;
+            int[] dx = { 1, -1, 0, 0 };
+            int[] dz = { 0, 0, 1, -1 };
+            while (queue.Count > 0)
+            {
+                int current = queue.Dequeue();
+                int d = dist[current];
+                if (d > 30 || visited > 900)
+                    break;
+                while (bands.Count <= d)
+                    bands.Add(new List<int>());
+                bands[d].Add(current);
+                visited++;
+                int cx = current / countZ, cz = current % countZ;
+                for (int k = 0; k < 4; k++)
+                {
+                    int nx = cx + dx[k], nz = cz + dz[k];
+                    if (nx < 0 || nz < 0 || nx >= countX || nz >= countZ)
+                        continue;
+                    int next = nx * countZ + nz;
+                    if (!reachable[next] || dist[next] >= 0 || Mathf.Abs(floorY[next] - floorY[current]) > 0.3f)
+                        continue;
+                    dist[next] = d + 1;
+                    queue.Enqueue(next);
+                }
+            }
+
+            if (bands.Count < 3)
+                return false;
+
+            // Width of a band = its extent across the passage (perpendicular to the way out).
+            float BandWidth(int k)
+            {
+                List<int> cells = bands[k];
+                Vector3 mean = Mean(cells);
+                Vector3 outward = k > 0 ? Flat(mean - Mean(bands[k - 1])) : Vector3.zero;
+                Vector3 across = outward.sqrMagnitude > 0.0001f ? Vector3.Cross(Vector3.up, outward.normalized) : Vector3.right;
+                float min = float.MaxValue, max = float.MinValue;
+                foreach (int cell in cells)
+                {
+                    float t2 = Vector3.Dot(CellCenter(cell / countZ, cell % countZ) - mean, across);
+                    min = Mathf.Min(min, t2);
+                    max = Mathf.Max(max, t2);
+                }
+
+                return max - min + Cell;
+            }
+
+            int last = bands.Count - 1;
+            float[] widths = new float[bands.Count];
+            for (int k = 1; k <= last; k++)
+                widths[k] = BandWidth(k);
+
+            float narrowest = float.MaxValue;
+            int mouth = 1;
+            for (int k = 1; k <= last; k++)
+            {
+                if (widths[k] > narrowest + 1.6f && k > 2)
+                    break;                                    // the floor opens up: stop here
+                if (widths[k] <= narrowest + 0.3f)
+                {
+                    if (widths[k] < narrowest)
+                        narrowest = widths[k];
+                    mouth = k;                               // keep the furthest narrow band
+                }
+            }
+
+            Vector3 mouthMean = Mean(bands[mouth]);
+            Vector3 back = Flat(Mean(bands[Mathf.Max(0, mouth - 1)]) - mouthMean);
+            if (back.sqrMagnitude < 0.0001f)
+                return false;
+
+            float y = 0f;
+            foreach (int cell in bands[mouth])
+                y += floorY[cell];
+            center = new Vector3(mouthMean.x, y / bands[mouth].Count, mouthMean.z);
+            towardStairs = back.normalized;
+            width = widths[mouth] + 0.3f;
+            return true;
+        }
+
+        private Vector3 Mean(List<int> cells)
+        {
+            Vector3 sum = Vector3.zero;
+            foreach (int cell in cells)
+                sum += CellCenter(cell / countZ, cell % countZ);
+            return sum / Mathf.Max(1, cells.Count);
+        }
+
+        private static Vector3 Flat(Vector3 value) => new(value.x, 0f, value.z);
 
         /// <summary>Debug: top-down map. 'o' reachable, '.' walkable but cut off, ' ' blocked/no floor.</summary>
         public string Dump()

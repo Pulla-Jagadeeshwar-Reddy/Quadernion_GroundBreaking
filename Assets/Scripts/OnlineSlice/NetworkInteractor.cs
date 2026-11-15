@@ -224,6 +224,16 @@ public class NetworkInteractor : NetworkBehaviour
         if (player.MovementLocked.Value)
             return;
 
+        // Crosshair: always visible (white), yellow when aiming at something usable.
+        bool aimingAtSomething = focusedRunner != null || (focused != null && !string.IsNullOrEmpty(focused.GetPrompt(player, inventory)));
+        Rect dot = new(Screen.width * 0.5f - 3f, Screen.height * 0.5f - 3f, 6f, 6f);
+        Color before = GUI.color;
+        GUI.color = new Color(0f, 0f, 0f, 0.6f);
+        GUI.DrawTexture(new Rect(dot.x - 1f, dot.y - 1f, dot.width + 2f, dot.height + 2f), Texture2D.whiteTexture);
+        GUI.color = aimingAtSomething ? new Color(1f, 0.85f, 0.3f) : Color.white;
+        GUI.DrawTexture(dot, Texture2D.whiteTexture);
+        GUI.color = before;
+
         string message = null;
         float progress = 0f;
         if (focusedRunner != null)
@@ -259,9 +269,6 @@ public class NetworkInteractor : NetworkBehaviour
             GUI.DrawTexture(new Rect(bar.x + 1f, bar.y + 1f, (bar.width - 2f) * progress, bar.height - 2f), Texture2D.whiteTexture);
             GUI.color = previous;
         }
-
-        // Crosshair dot.
-        GUI.Box(new Rect(Screen.width * 0.5f - 2f, Screen.height * 0.5f - 2f, 4f, 4f), GUIContent.none);
     }
 
     private void DrawMatchHud()
@@ -293,7 +300,8 @@ public class NetworkInteractor : NetworkBehaviour
 
         RunnerHud.Draw(routes, inventory, player);
 
-        if (Keyboard.current != null && Keyboard.current.tabKey.isPressed)
+        // The item finder is a hint: it unlocks only after a long stretch with no progress.
+        if (RunnerHud.HintUnlocked && Keyboard.current != null && Keyboard.current.tabKey.isPressed)
             DrawItemFinder();
     }
 

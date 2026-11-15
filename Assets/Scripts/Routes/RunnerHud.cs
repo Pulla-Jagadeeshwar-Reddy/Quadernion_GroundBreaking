@@ -25,6 +25,16 @@ public static class RunnerHud
     private static int cacheFrame = -1;
     private static List<RouteManager.RouteProgress> cache;
 
+    /// <summary>Seconds without picking anything up or finishing a step before the Tab hint unlocks.</summary>
+    public const float HintDelay = 90f;
+
+    /// <summary>Last time the Runner gained an item or finished a step (or the round started).</summary>
+    public static float LastProgressTime { get; private set; }
+
+    public static bool HintUnlocked => Time.time - LastProgressTime >= HintDelay;
+
+    private static bool hintAnnounced;
+
     private static readonly Dictionary<string, int> lastCounts = new();
     private static readonly Dictionary<string, int> lastDone = new();
     private static readonly Dictionary<string, bool> lastUnlocked = new();
@@ -268,13 +278,18 @@ public static class RunnerHud
 
         bool roundReset = hasBaseline && counts.Count == 0 && lastCounts.Count > 0 &&
                           routes.TrueForAll(r => r.DoneUnits == 0);
+        if (!hasBaseline || roundReset)
+            MarkProgress();
         if (hasBaseline && !roundReset)
         {
             foreach (KeyValuePair<string, int> pair in counts)
             {
                 lastCounts.TryGetValue(pair.Key, out int before);
                 if (pair.Value > before)
+                {
                     AddToast($"+{pair.Value - before}  {ItemIds.DisplayName(pair.Key)}", new Color(0.55f, 1f, 0.6f));
+                    MarkProgress();
+                }
             }
 
             foreach (KeyValuePair<string, int> pair in lastCounts)
@@ -286,11 +301,21 @@ public static class RunnerHud
 
             foreach (RouteManager.RouteProgress route in routes)
             {
-                if (lastDone.TryGetValue(route.Name, out int before) && route.DoneUnits > before && !route.Unlocked)
-                    AddToast($"{route.Name}: step done ({route.DoneUnits}/{route.TotalUnits})", RouteColor(route.Name));
+                if (lastDone.TryGetValue(route.Name, out int before) && route.DoneUnits > before)
+                {
+                    MarkProgress();
+                    if (!route.Unlocked)
+                        AddToast($"{route.Name}: step done ({route.DoneUnits}/{route.TotalUnits})", RouteColor(route.Name));
+                }
                 if (lastUnlocked.TryGetValue(route.Name, out bool wasOpen) && !wasOpen && route.Unlocked)
                     AddToast($"{route.Name.ToUpperInvariant()} EXIT OPEN!", new Color(0.45f, 1f, 0.55f), true);
             }
+        }
+
+        if (HintUnlocked && !hintAnnounced)
+        {
+            hintAnnounced = true;
+            AddToast("Stuck? Hold Tab for a hint", new Color(1f, 0.9f, 0.5f), true);
         }
 
         lastCounts.Clear();
@@ -303,6 +328,12 @@ public static class RunnerHud
         }
 
         hasBaseline = true;
+    }
+
+    private static void MarkProgress()
+    {
+        LastProgressTime = Time.time;
+        hintAnnounced = false;
     }
 
     public static void AddToast(string text, Color color, bool big = false)
@@ -356,7 +387,8 @@ public static class RunnerHud
         string other = ControlSettings.RunnerUsesWasd ? "arrows" : "WASD";
         GUI.Label(new Rect(16f, Screen.height - 46f, 520f, 40f),
             $"{ControlSettings.RunnerMoveLabel} move   {sprint} sprint   C crouch   Hold E use\n" +
-            $"F jam door   Tab item finder   H {(compact ? "expand" : "compact")} routes   F2 use {other}", hintStyle);
+            $"F jam door   H {(compact ? "expand" : "compact")} routes   F2 use {other}" +
+            (HintUnlocked ? "   Tab: hint" : ""), hintStyle);
     }
 
     // ------------------------------------------------------------------ helpers

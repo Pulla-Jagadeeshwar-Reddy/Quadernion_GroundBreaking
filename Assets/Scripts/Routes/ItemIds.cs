@@ -11,6 +11,9 @@ public static class ItemIds
     public const string Crowbar = "T_Crowbar";
 
     public const string R1DoorKey = "R1_DoorKey";
+
+    /// <summary>Not an item: a door lock that never opens (boarded-up doors).</summary>
+    public const string Boarded = "Boarded";
     public const string R1Passcode = "R1_Passcode";
 
     public const string R2Fuse = "R2_Fuse";
@@ -30,7 +33,8 @@ public static class ItemIds
             case Hammer: return "Hammer";
             case Screwdriver: return "Screwdriver";
             case Crowbar: return "Crowbar";
-            case R1DoorKey: return "Back Door Key";
+            case R1DoorKey: return "Gold Door Key";
+            case Boarded: return "Boarded up";
             case R1Passcode: return "Door Passcode";
             case R2Fuse: return "Fuse";
             case R3Plank: return "Wooden Plank";

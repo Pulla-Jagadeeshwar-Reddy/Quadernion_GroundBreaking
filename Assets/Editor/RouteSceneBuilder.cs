@@ -162,7 +162,6 @@ public static class RouteSceneBuilder
     {
         Scene scene = EditorSceneManager.OpenScene(ScenePath, OpenSceneMode.Single);
         grid = null;
-        pendingBoards.Clear();
         EnsureFolder(PickupFolder);
         EnsureFolder(MaterialFolder);
 
@@ -199,10 +198,8 @@ public static class RouteSceneBuilder
         warnings.Add($"Walkable floor reachable from spawn: {grid.ReachableArea:0} m² ({grid.ReachableCells} cells).");
         File.WriteAllText(Path.Combine(Application.dataPath, "../Logs/reach_map.txt"), grid.Dump());
 
-        // Wooden boards across sealed stairwells (built before the grid existed).
-        foreach ((Transform barrier, StairSpec stair) in pendingBoards)
-            BoardUpStair(barrier, stair, materials);
-        pendingBoards.Clear();
+        // Doors that lead nowhere the player can go: boarded and locked for good.
+        int deadDoors = BoardUpDeadDoors(Child(root.transform, "Boarded Doors"), materials);
 
         // The floor model's own desks, fans and windows (found by name, so a new model just works).
         List<EnvObject> envObjects = FindEnvObjects(root.transform);
@@ -216,14 +213,15 @@ public static class RouteSceneBuilder
 
         Physics.SyncTransforms();
 
+        // Walk the floor again with the route doors/shutters in place, so no item lands in a
+        // passage that is only open once a route is done.
+        grid = WalkGrid.Build(root.transform);
+
         janitorWarning = null;
         int spotCount = BuildSpawnPoints(Child(root.transform, "Spawn Points"), root.transform);
         if (janitorWarning != null)
             warnings.Add(janitorWarning);
-
-        // Boards only where the player can see an opening but never get in (dead doors, cut-off areas).
-        int boarded = BoardUpCutOffAreas(Child(root.transform, "Boarded Openings"), materials);
-        warnings.Add($"Boarded up {SealedStairs.Length} sealed stairwells and {boarded} openings into unreachable areas (see Logs/boarded.txt).");
+        warnings.Add($"Boarded {SealedStairs.Length} sealed stair passages at their entrance and {deadDoors} doors that lead nowhere.");
 
         GameObject managerObject = Child(root.transform, "Route Manager").gameObject;
         managerObject.AddComponent<NetworkObject>();
@@ -300,7 +298,7 @@ public static class RouteSceneBuilder
         // step itself, so aiming at it anywhere gives the prompt. Step 1 unscrews the boards,
         // step 2 opens the padlock with the key and the passcode.
         RouteInteractable stairDoor = NewStep(parent, "R1_StairDoor", Flat(StairsLocksmith.Center), warnings, snap: false);
-        GameObject barrier = BuildStairBarrier(stairDoor.transform, StairsLocksmith, materials, "Boarded Barricade");
+        GameObject barrier = BuildStairBarrier(stairDoor.transform, StairsLocksmith, materials, "Gold Stair Door", StairBlock.GoldDoor);
         GameObject padlock = Box("Padlock", new Vector3(0.3f, 0.35f, 0.3f), new Vector3(0f, 1.0f, 0f), materials.Brass);
         padlock.transform.SetParent(barrier.transform, true);
         Object.DestroyImmediate(padlock.GetComponent<Collider>());
@@ -353,7 +351,7 @@ public static class RouteSceneBuilder
         panel.Configure("R2_Panel", route, "Fuse Panel", "Fit fuses into", 8f, 1, false, NoiseLevel.Loud, NoiseLevel.None,
             new[] { cover }, Items((ItemIds.R2Fuse, 3)), Items((ItemIds.R2Fuse, 3)), null);
 
-        GameObject shutter = BuildStairBarrier(parent, StairsBlackout, materials, "R2_Shutter (blocker)", materials.Shutter);
+        GameObject shutter = BuildStairBarrier(parent, StairsBlackout, materials, "R2_Shutter (blocker)", StairBlock.Shutter);
         panel.ConfigureVisuals(fuseParts, new[] { shutter }, null, ledParts, null);
 
         BuildExit(parent, "Exit - Blackout", Flat(StairsBlackout.Center), route, new[] { panel },
@@ -480,8 +478,9 @@ public static class RouteSceneBuilder
             Items((ItemIds.R3Plank, 8), (ItemIds.R3Nails, 1)), null);
         ladder.ConfigureVisuals(null, null, stages, null, null);
 
-        BuildExit(parent, "Exit - Ladder", edge + outward * -0.6f + Vector3.up * 0.6f, route, new[] { ladder },
-            null, materials);
+        // The escape is the ladder itself: aim at it (or walk onto it) once it is built.
+        BuildExit(parent, "Exit - Ladder", ladder.transform.position + ladder.transform.forward * 0.45f, route, new[] { ladder },
+            "Build the ladder first", materials, ladderExit: true);
         return pcs.ToArray();
     }
 
@@ -1024,7 +1023,7 @@ public static class RouteSceneBuilder
     }
 
     private static void BuildExit(Transform parent, string name, Vector3 position, string route, RouteInteractable[] required,
-        string blockedPrompt, Materials materials)
+        string blockedPrompt, Materials materials, bool ladderExit = false)
     {
         GameObject exit = new(name);
         exit.transform.SetParent(parent, false);
@@ -1033,6 +1032,15 @@ public static class RouteSceneBuilder
         NetworkEscapePoint escape = exit.AddComponent<NetworkEscapePoint>();
         // Walking into an open exit (down the stairs, into the lift, onto the ladder) escapes too.
         escape.Configure(route, required, blockedPrompt, 2.0f);
+
+        if (ladderExit)
+        {
+            // Hitbox over the top of the ladder (railing height and a bit below).
+            BoxCollider grab = exit.AddComponent<BoxCollider>();
+            grab.center = new Vector3(0f, 0.3f, 0f);
+            grab.size = new Vector3(0.9f, 1.6f, 0.6f);
+            return;
+        }
 
         GameObject sign = AddModel(exit.transform, "Shared", "S_ExitSign",
             () => Box("Exit Sign", new Vector3(0.6f, 0.25f, 0.6f), new Vector3(0f, 0.9f, 0f), materials.ExitGlow));
@@ -1103,7 +1111,19 @@ public static class RouteSceneBuilder
         return best;
     }
 
-    private static GameObject BuildStairBarrier(Transform parent, StairSpec stair, Materials materials, string name, Material material = null)
+    private enum StairBlock
+    {
+        Boards,
+        Shutter,
+        GoldDoor,
+    }
+
+    /// <summary>
+    /// Blocks a stairwell: a collider over the stairwell itself, plus a visible blocker (boards, the
+    /// power shutter or the Locksmith route's gold door) across the entrance of the passage leading
+    /// to it, or across the stairwell's open side when it opens straight onto a wide area.
+    /// </summary>
+    private static GameObject BuildStairBarrier(Transform parent, StairSpec stair, Materials materials, string name, StairBlock kind = StairBlock.Boards)
     {
         GameObject barrier = new(name);
         barrier.transform.SetParent(parent, false);
@@ -1111,70 +1131,182 @@ public static class RouteSceneBuilder
         BoxCollider blocker = barrier.AddComponent<BoxCollider>();
         blocker.size = stair.Size;
 
-        // Wooden boards across the stairwell's open sides (the power shutter keeps a solid look).
-        if (material == null)
+        (Vector3 center, Vector3 facing, float width) = FindStairEntrance(stair);
+        GameObject visual = kind switch
         {
-            if (grid != null)
-                BoardUpStair(barrier.transform, stair, materials);
-            else
-                pendingBoards.Add((barrier.transform, stair));
-            return barrier;
-        }
-
-        // Power shutter: a roller shutter across the entrance.
-        BoardUpStair(barrier.transform, stair, materials, true);
+            StairBlock.Shutter => ShutterPanel(center, facing, width, materials),
+            StairBlock.GoldDoor => GoldDoorPanel(center, facing, width, materials),
+            _ => BoardPanel("Boards", center, facing, width, materials, true),
+        };
+        visual.transform.SetParent(barrier.transform, true);
         return barrier;
     }
 
-    private static readonly List<(Transform barrier, StairSpec stair)> pendingBoards = new();
-
-    /// <summary>Boards across the stairwell's entrance: the side nearest floor the player can reach.</summary>
-    private static void BoardUpStair(Transform parent, StairSpec stair, Materials materials, bool shutter = false)
+    /// <summary>
+    /// The open side of a stairwell (the side whose view goes furthest before a wall), then out along
+    /// the passage until it widens: that mouth is where the blocker goes. Returns its floor centre,
+    /// the direction facing back toward the stairs, and its width.
+    /// </summary>
+    private static (Vector3 center, Vector3 facing, float width) FindStairEntrance(StairSpec stair)
     {
-        const float pad = 0.2f;
-        (Vector3 point, Vector3 along, Vector3 outward, float length)[] sides =
+        Physics.SyncTransforms();
+        const float pad = 0.25f;
+        (Vector3 point, Vector3 outward, float length)[] sides =
         {
-            (new Vector3(stair.MaxX + pad, 0f, (stair.MinZ + stair.MaxZ) * 0.5f), Vector3.forward, Vector3.right, stair.MaxZ - stair.MinZ + pad * 2f),
-            (new Vector3(stair.MinX - pad, 0f, (stair.MinZ + stair.MaxZ) * 0.5f), Vector3.forward, Vector3.left, stair.MaxZ - stair.MinZ + pad * 2f),
-            (new Vector3((stair.MinX + stair.MaxX) * 0.5f, 0f, stair.MaxZ + pad), Vector3.right, Vector3.forward, stair.MaxX - stair.MinX + pad * 2f),
-            (new Vector3((stair.MinX + stair.MaxX) * 0.5f, 0f, stair.MinZ - pad), Vector3.right, Vector3.back, stair.MaxX - stair.MinX + pad * 2f),
+            (new Vector3(stair.MaxX + pad, 1f, (stair.MinZ + stair.MaxZ) * 0.5f), Vector3.right, stair.MaxZ - stair.MinZ + 0.4f),
+            (new Vector3(stair.MinX - pad, 1f, (stair.MinZ + stair.MaxZ) * 0.5f), Vector3.left, stair.MaxZ - stair.MinZ + 0.4f),
+            (new Vector3((stair.MinX + stair.MaxX) * 0.5f, 1f, stair.MaxZ + pad), Vector3.forward, stair.MaxX - stair.MinX + 0.4f),
+            (new Vector3((stair.MinX + stair.MaxX) * 0.5f, 1f, stair.MinZ - pad), Vector3.back, stair.MaxX - stair.MinX + 0.4f),
         };
 
-        int bestSide = 0;
-        float bestDistance = float.PositiveInfinity;
+        int open = 0;
+        float bestRun = -1f;
         for (int index = 0; index < sides.Length; index++)
         {
-            float distance = ReachDistance(sides[index].point + sides[index].outward * 0.5f);
-            if (distance < bestDistance)
+            float run = Physics.Raycast(sides[index].point, sides[index].outward, out RaycastHit hit, 12f,
+                Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore) ? hit.distance : 12f;
+            if (run > bestRun)
             {
-                bestDistance = distance;
-                bestSide = index;
+                bestRun = run;
+                open = index;
             }
         }
 
-        // One panel, across the entrance (the side players walk up to).
-        if (shutter)
-            ShutterSide(parent, sides[bestSide].point, sides[bestSide].outward, sides[bestSide].length, materials);
-        else
-            BoardSide(parent, sides[bestSide].point, sides[bestSide].outward, sides[bestSide].length, materials, "Boards");
+        Vector3 start = sides[open].point;
+        Vector3 outward = sides[open].outward;
+        Vector3 across = Vector3.Cross(Vector3.up, outward);
+        Vector3 center = new(start.x, 0f, start.z);
+        float width = sides[open].length;
+        const float wide = 3.2f;
+
+        for (float d = 0.2f; d <= 10f; d += 0.2f)
+        {
+            Vector3 probe = start + outward * d;
+            float left = Physics.Raycast(probe, -across, out RaycastHit l, 6f, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore) ? l.distance : 6f;
+            float right = Physics.Raycast(probe, across, out RaycastHit r, 6f, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore) ? r.distance : 6f;
+            if (left + right > wide)
+                break;                                    // the passage opens up here
+
+            center = probe + across * ((right - left) * 0.5f);
+            width = left + right;
+            if (Physics.Raycast(probe, outward, 0.25f, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore))
+                break;                                    // passage turns or ends at a door
+        }
+
+        float floorY = Physics.Raycast(new Vector3(center.x, 1f, center.z), Vector3.down, out RaycastHit floor, 2f,
+            Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore) ? floor.point.y : 0f;
+        return (new Vector3(center.x, floorY, center.z), -outward, Mathf.Clamp(width, 0.8f, Mathf.Max(wide, sides[open].length)));
     }
 
-    private static void ShutterSide(Transform parent, Vector3 point, Vector3 outward, float length, Materials materials)
+    private static GameObject ShutterPanel(Vector3 center, Vector3 facing, float width, Materials materials)
     {
-        float floorY = grid != null && grid.TryNearestReachable(point + outward * 0.5f, 1.5f, out Vector3 floor) ? floor.y : 0f;
-        GameObject model = AddModel(parent, "Route02_Blackout", "R2_Shutter",
+        GameObject root = new("Power Shutter");
+        root.transform.SetPositionAndRotation(center, Quaternion.LookRotation(facing, Vector3.up));
+        GameObject model = AddModel(root.transform, "Route02_Blackout", "R2_Shutter",
             () => Box("Shutter", new Vector3(1f, 2.2f, 0.06f), new Vector3(0f, 1.1f, 0f), materials.Shutter));
         foreach (Collider part in model.GetComponentsInChildren<Collider>())
             Object.DestroyImmediate(part);
-        model.transform.SetPositionAndRotation(new Vector3(point.x, floorY, point.z), Quaternion.LookRotation(-outward, Vector3.up));
-        model.transform.localScale = new Vector3(length, 1f, 1f);
+        model.transform.localScale = new Vector3(width, 1f, 1f);
+        BoxCollider blocker = root.AddComponent<BoxCollider>();
+        blocker.center = new Vector3(0f, 1.1f, 0f);
+        blocker.size = new Vector3(width, 2.2f, 0.3f);
+        return root;
     }
 
-    private static void BoardSide(Transform parent, Vector3 point, Vector3 outward, float length, Materials materials, string name)
+    /// <summary>The Locksmith route's door: gold (matches the Gold Door Key), boarded, padlocked.</summary>
+    private static GameObject GoldDoorPanel(Vector3 center, Vector3 facing, float width, Materials materials)
     {
-        float floorY = grid != null && grid.TryNearestReachable(point + outward * 0.5f, 1.5f, out Vector3 floor) ? floor.y : 0f;
-        GameObject boards = BoardPanel(name, new Vector3(point.x, floorY, point.z), -outward, length, materials, false);
-        boards.transform.SetParent(parent, true);
+        GameObject root = new("Gold Door");
+        root.transform.SetPositionAndRotation(center, Quaternion.LookRotation(facing, Vector3.up));
+        void Part(string name, Vector3 size, Vector3 position, Material material)
+        {
+            GameObject part = Box(name, size, position, material);
+            part.transform.SetParent(root.transform, false);
+            Object.DestroyImmediate(part.GetComponent<Collider>());
+        }
+
+        Part("Frame L", new Vector3(0.1f, 2.2f, 0.16f), new Vector3(-width * 0.5f + 0.05f, 1.1f, 0f), materials.WoodDark);
+        Part("Frame R", new Vector3(0.1f, 2.2f, 0.16f), new Vector3(width * 0.5f - 0.05f, 1.1f, 0f), materials.WoodDark);
+        Part("Frame Top", new Vector3(width, 0.12f, 0.16f), new Vector3(0f, 2.16f, 0f), materials.WoodDark);
+        Part("Door", new Vector3(width - 0.2f, 2.08f, 0.06f), new Vector3(0f, 1.04f, 0f), materials.GoldDoor);
+        Part("Key Sign", new Vector3(0.34f, 0.18f, 0.02f), new Vector3(0f, 1.7f, 0.045f), materials.Brass);
+        for (int index = 0; index < 3; index++)
+        {
+            GameObject plank = Box($"Plank {index + 1}", new Vector3(width + 0.1f, 0.16f, 0.04f),
+                new Vector3(0f, 0.6f + index * 0.45f, 0.06f), materials.Wood);
+            plank.transform.localRotation = Quaternion.Euler(0f, 0f, index % 2 == 0 ? 6f : -5f);
+            plank.transform.SetParent(root.transform, false);
+            Object.DestroyImmediate(plank.GetComponent<Collider>());
+        }
+
+        Part("Padlock", new Vector3(0.12f, 0.14f, 0.06f), new Vector3(width * 0.25f, 1.05f, 0.1f), materials.Brass);
+        Part("Shackle", new Vector3(0.08f, 0.08f, 0.02f), new Vector3(width * 0.25f, 1.15f, 0.1f), materials.Metal);
+
+        BoxCollider blocker = root.AddComponent<BoxCollider>();
+        blocker.center = new Vector3(0f, 1.1f, 0.03f);
+        blocker.size = new Vector3(width, 2.2f, 0.25f);
+        return root;
+    }
+
+    /// <summary>
+    /// Working doors with no floor the player can reach on one side lead nowhere: lock them for good
+    /// (a DoorLockRule with the Boarded lock) and nail boards across them on the reachable side.
+    /// Door-shaped collision with no working door gets the same boards.
+    /// </summary>
+    private static int BoardUpDeadDoors(Transform parent, Materials materials)
+    {
+        if (grid == null)
+            return 0;
+
+        System.Text.StringBuilder log = new();
+        HashSet<Transform> seen = new();
+        int count = 0;
+
+        void Board(Bounds leaf, string what, bool lockDoor)
+        {
+            bool thinX = leaf.size.x < leaf.size.z;
+            Vector3 normal = thinX ? Vector3.right : Vector3.forward;
+            float front = ReachDistance(leaf.center + normal * 0.8f);
+            float back = ReachDistance(leaf.center - normal * 0.8f);
+            bool frontOk = front <= 0.6f, backOk = back <= 0.6f;
+            if (frontOk == backOk)
+                return;                                   // both sides usable, or neither: leave it
+
+            Vector3 side = frontOk ? normal : -normal;
+            float width = (thinX ? leaf.size.z : leaf.size.x) + 0.3f;
+            float floorY = grid.TryNearestReachable(leaf.center + side * 0.8f, 1.5f, out Vector3 floor) ? floor.y : 0f;
+            GameObject panel = BoardPanel($"Boarded Door {count + 1}", new Vector3(leaf.center.x, floorY, leaf.center.z) + side * 0.1f,
+                side, width, materials, false);
+            panel.transform.SetParent(parent, true);
+            if (lockDoor)
+            {
+                GameObject rule = new($"Boarded Door Lock {count + 1}");
+                rule.transform.SetParent(parent, false);
+                rule.transform.position = leaf.center;
+                rule.AddComponent<DoorLockRule>().Configure(ItemIds.Boarded, 1.0f);
+            }
+
+            log.AppendLine($"{panel.name}: {what} at ({leaf.center.x:0.0}, {leaf.center.z:0.0})");
+            count++;
+        }
+
+        foreach (NetworkLockedDoor door in Object.FindObjectsByType<NetworkLockedDoor>(FindObjectsInactive.Exclude))
+        {
+            if (door.TryGetEditorLeafBounds(out Bounds leaf, out Transform leafTransform) && seen.Add(leafTransform))
+                Board(leaf, "door leading nowhere", true);
+        }
+
+        foreach (Collider collider in Object.FindObjectsByType<Collider>(FindObjectsInactive.Exclude))
+        {
+            if (!collider.enabled || !collider.name.StartsWith("Collision - Door", StringComparison.Ordinal))
+                continue;
+            if (Object.FindObjectsByType<NetworkLockedDoor>(FindObjectsInactive.Exclude).Any(d => d.OwnsCollider(collider)))
+                continue;
+            Board(collider.bounds, "door with no working door", false);
+        }
+
+        File.WriteAllText(Path.Combine(Application.dataPath, "../Logs/boarded.txt"), log.ToString());
+        return count;
     }
 
     /// <summary>
@@ -1214,36 +1346,6 @@ public static class RouteSceneBuilder
         }
 
         return panel;
-    }
-
-    /// <summary>
-    /// Finds door-sized openings between reachable floor and larger walkable areas the player can
-    /// never get into (rooms behind dead doors, cut-off corners) and boards them up. Long edges
-    /// such as railings are left alone. Writes Logs/boarded.txt.
-    /// </summary>
-    private static int BoardUpCutOffAreas(Transform parent, Materials materials)
-    {
-        if (grid == null)
-            return 0;
-
-        List<(Vector3 center, Vector3 inward, float span)> openings = grid.FindCutOffOpenings(25, 0.6f, 3.2f);
-        System.Text.StringBuilder log = new();
-        int count = 0;
-        foreach ((Vector3 center, Vector3 inward, float span) in openings)
-        {
-            // Never board the ladder route's atrium edge.
-            if (Vector3.Distance(Flat(center), Flat(LadderSpot)) < 4f || count >= 25)
-                continue;
-
-            Vector3 position = center + inward * 0.35f;
-            GameObject panel = BoardPanel($"Boarded Opening {count + 1}", position, -inward, span, materials, true);
-            panel.transform.SetParent(parent, true);
-            log.AppendLine($"{panel.name}: ({position.x:0.0}, {position.z:0.0}) span {span:0.0} m facing ({-inward.x:0.0}, {-inward.z:0.0})");
-            count++;
-        }
-
-        File.WriteAllText(Path.Combine(Application.dataPath, "../Logs/boarded.txt"), log.ToString());
-        return count;
     }
 
     private static GameObject Glow(Transform parent, Vector3 localPosition, Materials materials)
@@ -1578,156 +1680,6 @@ public static class RouteSceneBuilder
             }
         }
 
-        /// <summary>
-        /// Openings between reachable floor and walkable-but-unreachable regions of at least
-        /// <paramref name="minRegionCells"/> cells. Returns the reachable-side centre, the direction
-        /// into the cut-off area and the opening width, for widths in [minSpan, maxSpan].
-        /// </summary>
-        public List<(Vector3 center, Vector3 inward, float span)> FindCutOffOpenings(int minRegionCells, float minSpan, float maxSpan)
-        {
-            int total = countX * countZ;
-            int[] region = new int[total];
-            List<int> regionSize = new() { 0 };
-            Queue<int> queue = new();
-            int[] dx4 = { 1, -1, 0, 0 };
-            int[] dz4 = { 0, 0, 1, -1 };
-
-            for (int start = 0; start < total; start++)
-            {
-                if (!walkable[start] || reachable[start] || region[start] != 0)
-                    continue;
-
-                int label = regionSize.Count;
-                regionSize.Add(0);
-                region[start] = label;
-                queue.Enqueue(start);
-                while (queue.Count > 0)
-                {
-                    int current = queue.Dequeue();
-                    regionSize[label]++;
-                    int cx = current / countZ, cz = current % countZ;
-                    for (int d = 0; d < 4; d++)
-                    {
-                        int nx = cx + dx4[d], nz = cz + dz4[d];
-                        if (nx < 0 || nz < 0 || nx >= countX || nz >= countZ)
-                            continue;
-                        int next = nx * countZ + nz;
-                        if (!walkable[next] || reachable[next] || region[next] != 0)
-                            continue;
-                        region[next] = label;
-                        queue.Enqueue(next);
-                    }
-                }
-            }
-
-            // Reachable cells within 2 cells of a big cut-off region.
-            int[] frontier = new int[total];
-            for (int index = 0; index < total; index++)
-            {
-                if (!reachable[index])
-                    continue;
-                int cx = index / countZ, cz = index % countZ;
-                for (int ox = -2; ox <= 2 && frontier[index] == 0; ox++)
-                for (int oz = -2; oz <= 2; oz++)
-                {
-                    int nx = cx + ox, nz = cz + oz;
-                    if (nx < 0 || nz < 0 || nx >= countX || nz >= countZ)
-                        continue;
-                    int next = nx * countZ + nz;
-                    if (region[next] != 0 && regionSize[region[next]] >= minRegionCells)
-                    {
-                        frontier[index] = region[next];
-                        break;
-                    }
-                }
-            }
-
-            List<(Vector3, Vector3, float)> result = new();
-            bool[] seen = new bool[total];
-            for (int start = 0; start < total; start++)
-            {
-                if (frontier[start] == 0 || seen[start])
-                    continue;
-
-                int label = frontier[start];
-                List<int> cluster = new();
-                seen[start] = true;
-                queue.Enqueue(start);
-                while (queue.Count > 0)
-                {
-                    int current = queue.Dequeue();
-                    cluster.Add(current);
-                    int cx = current / countZ, cz = current % countZ;
-                    for (int ox = -1; ox <= 1; ox++)
-                    for (int oz = -1; oz <= 1; oz++)
-                    {
-                        int nx = cx + ox, nz = cz + oz;
-                        if (nx < 0 || nz < 0 || nx >= countX || nz >= countZ)
-                            continue;
-                        int next = nx * countZ + nz;
-                        if (seen[next] || frontier[next] != label)
-                            continue;
-                        seen[next] = true;
-                        queue.Enqueue(next);
-                    }
-                }
-
-                // Centre of the frontier, and of the cut-off cells right behind it.
-                Vector3 center = Vector3.zero;
-                float y = 0f;
-                foreach (int cell in cluster)
-                {
-                    center += CellCenter(cell / countZ, cell % countZ);
-                    y += floorY[cell];
-                }
-                center /= cluster.Count;
-                y /= cluster.Count;
-
-                Vector3 behind = Vector3.zero;
-                int behindCount = 0;
-                foreach (int cell in cluster)
-                {
-                    int cx = cell / countZ, cz = cell % countZ;
-                    for (int ox = -2; ox <= 2; ox++)
-                    for (int oz = -2; oz <= 2; oz++)
-                    {
-                        int nx = cx + ox, nz = cz + oz;
-                        if (nx < 0 || nz < 0 || nx >= countX || nz >= countZ)
-                            continue;
-                        if (region[nx * countZ + nz] != label)
-                            continue;
-                        behind += CellCenter(nx, nz);
-                        behindCount++;
-                    }
-                }
-
-                if (behindCount == 0)
-                    continue;
-                Vector3 inward = behind / behindCount - center;
-                inward.y = 0f;
-                if (inward.sqrMagnitude < 0.0001f)
-                    continue;
-                inward.Normalize();
-
-                Vector3 along = Vector3.Cross(Vector3.up, inward);
-                float min = float.MaxValue, max = float.MinValue;
-                foreach (int cell in cluster)
-                {
-                    float t = Vector3.Dot(CellCenter(cell / countZ, cell % countZ) - center, along);
-                    min = Mathf.Min(min, t);
-                    max = Mathf.Max(max, t);
-                }
-
-                float span = max - min + Cell;
-                if (span < minSpan || span > maxSpan)
-                    continue;
-
-                result.Add((new Vector3(center.x, y, center.z) + along * ((min + max) * 0.5f), inward, span));
-            }
-
-            return result;
-        }
-
         /// <summary>Debug: top-down map. 'o' reachable, '.' walkable but cut off, ' ' blocked/no floor.</summary>
         public string Dump()
         {
@@ -2034,6 +1986,7 @@ public static class RouteSceneBuilder
     {
         public readonly Material Wood = Make("M_Route_Wood", new Color(0.55f, 0.36f, 0.2f), 0.75f);
         public readonly Material WoodDark = Make("M_Route_WoodDark", new Color(0.3f, 0.19f, 0.1f), 0.8f);
+        public readonly Material GoldDoor = Make("M_Route_GoldDoor", new Color(0.9f, 0.68f, 0.18f), 0.45f, 0.3f);
         public readonly Material Metal = Make("M_Route_Metal", new Color(0.62f, 0.64f, 0.66f), 0.35f, 0.8f);
         public readonly Material DarkMetal = Make("M_Route_DarkMetal", new Color(0.16f, 0.17f, 0.19f), 0.4f, 0.6f);
         public readonly Material Brass = Make("M_Route_Brass", new Color(0.85f, 0.65f, 0.25f), 0.3f, 0.9f);

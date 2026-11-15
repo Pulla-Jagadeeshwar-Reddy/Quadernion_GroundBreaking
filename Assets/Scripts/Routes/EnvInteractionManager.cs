@@ -217,7 +217,9 @@ public class EnvInteractionManager : NetworkBehaviour
         NetworkInventory inventory, out INetworkInteractable target)
     {
         target = null;
+        // Desks may sit behind a railing or chair: allow a little more than other spots.
         float best = Mathf.Min(maxDistance, firstSolid + 0.15f);
+        float deskBest = Mathf.Min(maxDistance, firstSolid + 0.7f);
         Vector3? point = !float.IsPositiveInfinity(firstSolid) && firstSolid <= maxDistance ? ray.GetPoint(firstSolid) : null;
 
         for (int index = 0; index < spots.Length && index < targets.Length; index++)
@@ -226,15 +228,17 @@ public class EnvInteractionManager : NetworkBehaviour
             Bounds bounds = new(spot.center, spot.size + Vector3.one * 0.04f);
             float distance;
 
+            float limit = spot.kind == EnvKind.Desk ? deskBest : best;
             if (spot.kind == EnvKind.Window && point.HasValue && bounds.Contains(point.Value))
                 distance = firstSolid;
-            else if (!bounds.IntersectRay(ray, out distance) || distance > best)
+            else if (!bounds.IntersectRay(ray, out distance) || distance > limit)
                 continue;
 
-            if (distance > best || string.IsNullOrEmpty(PromptFor(index, player)))
+            if (distance > limit || string.IsNullOrEmpty(PromptFor(index, player)))
                 continue;
 
-            best = distance;
+            best = Mathf.Min(best, distance);
+            deskBest = Mathf.Min(deskBest, distance);
             target = targets[index];
         }
 
@@ -346,15 +350,23 @@ public class EnvInteractionManager : NetworkBehaviour
                 ? new[] { new Vector3(b.center.x, y0, b.min.z), new Vector3(b.center.x, y0, b.max.z), new Vector3(b.center.x, y1, b.max.z), new Vector3(b.center.x, y1, b.min.z) }
                 : new[] { new Vector3(b.min.x, y0, b.center.z), new Vector3(b.max.x, y0, b.center.z), new Vector3(b.max.x, y1, b.center.z), new Vector3(b.min.x, y1, b.center.z) };
         }
-        else
+        else if (spot.kind == EnvKind.Fan)
         {
-            // Desks: around the top. Fans: around the underside.
-            // Desks: around the top of the desk. Fans: around the underside.
-            float y = spot.kind == EnvKind.Fan ? b.min.y : b.max.y + 0.02f;
+            float y = b.min.y;
             corners = new[] { new Vector3(b.min.x, y, b.min.z), new Vector3(b.max.x, y, b.min.z), new Vector3(b.max.x, y, b.max.z), new Vector3(b.min.x, y, b.max.z) };
         }
+        else
+        {
+            // Desks: the whole bounding box as a wireframe (one path, some edges drawn twice).
+            Vector3 b0 = new(b.min.x, b.min.y, b.min.z), b1 = new(b.max.x, b.min.y, b.min.z);
+            Vector3 b2 = new(b.max.x, b.min.y, b.max.z), b3 = new(b.min.x, b.min.y, b.max.z);
+            Vector3 t0 = new(b.min.x, b.max.y, b.min.z), t1 = new(b.max.x, b.max.y, b.min.z);
+            Vector3 t2 = new(b.max.x, b.max.y, b.max.z), t3 = new(b.min.x, b.max.y, b.max.z);
+            corners = new[] { b0, b1, b2, b3, b0, t0, t1, b1, t1, t2, b2, t2, t3, b3, t3, t0 };
+        }
 
-        outline.positionCount = 4;
+        outline.loop = spot.kind != EnvKind.Desk;
+        outline.positionCount = corners.Length;
         outline.SetPositions(corners);
         bool usable = target.HoldSeconds > 0f || spot.kind == EnvKind.Fan;
         Color color = usable ? new Color(1f, 0.85f, 0.3f, 0.9f) : new Color(0.6f, 0.6f, 0.6f, 0.6f);

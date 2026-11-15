@@ -678,6 +678,9 @@ public class NetworkLockedDoor : NetworkBehaviour, INetworkInteractable, ISecond
         if (player.IsGranny && !allowGranny)
             return "Granny cannot use this door";
 
+        if (RequiredItemId == ItemIds.Boarded)
+            return "Boarded up";
+
         if (Jammed.Value)
             return player.IsGranny ? "Hold E  Break down the jammed door" : "Jammed shut";
 
@@ -730,11 +733,18 @@ public class NetworkLockedDoor : NetworkBehaviour, INetworkInteractable, ISecond
 
         // Granny holds a master key: she can always open route-locked doors to chase the Runner.
         string lockItem = RequiredItemId;
+        if (lockItem == ItemIds.Boarded)
+            return;
+
         if (!IsOpen.Value && lockItem != null && !role.IsGranny)
         {
             NetworkInventory inventory = playerObject.GetComponent<NetworkInventory>();
             if (inventory == null || !inventory.Has(lockItem))
                 return;
+
+            // The key is used up: the door stays unlocked for the rest of the round.
+            inventory.ServerTake(lockItem, 1);
+            RequiredItem.Value = default;
         }
 
         IsOpen.Value = !IsOpen.Value;

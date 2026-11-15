@@ -51,7 +51,16 @@ public static class StairShots
                 if (child.GetComponentInChildren<Renderer>() == null)
                     continue;
                 // Blockers face the stairs, so the player stands on the other side.
-                Vector3 eye = child.position + (n == "R5_ChainLock" ? child.forward : -child.forward) * 3.5f + Vector3.up * 1.45f;
+                Vector3 back = n == "R5_ChainLock" ? child.forward : -child.forward;
+                Vector3 eye = child.position + back * 3.5f + Vector3.up * 1.45f;
+                // Step closer until the camera is not inside a wall (no closer than 0.8 m).
+                for (float distance = 3.5f; distance >= 0.8f; distance -= 0.3f)
+                {
+                    eye = child.position + back * distance + Vector3.up * 1.45f;
+                    if (!Physics.CheckSphere(eye, 0.25f, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore) &&
+                        !Physics.Linecast(eye, child.position + Vector3.up * 1.0f + back * 0.3f, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore))
+                        break;
+                }
                 cam.orthographic = false;
                 cam.fieldOfView = 65f;
                 cam.farClipPlane = 60f;

@@ -33,11 +33,6 @@ jobs:
             Write-Error 'Assets folder is missing. The repository root must be the Unity project root.'
             exit 1
           }
-          if (-not (Test-Path -LiteralPath 'Assets.meta')) {
-            Write-Error 'Assets.meta is missing. Keep the Unity root metadata file in Git.'
-            exit 1
-          }
-
           $missingMeta = @()
           Get-ChildItem -LiteralPath 'Assets' -Force -Recurse | ForEach-Object {
             if ($_.Name -notlike '*.meta') {

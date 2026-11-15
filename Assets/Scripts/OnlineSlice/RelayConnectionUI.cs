@@ -35,22 +35,29 @@ public class RelayConnectionUI : MonoBehaviour
             return;
         }
 
-        GUI.Box(new Rect(10f, 10f, 380f, string.IsNullOrEmpty(lastError) ? 190f : 220f), "First Floor — Online 1v1 Lobby");
+        GUI.Box(new Rect(10f, 10f, 380f, string.IsNullOrEmpty(lastError) ? 285f : 330f), "First Floor — Playtest / Online Lobby");
         GUI.Label(new Rect(25f, 42f, 340f, 38f), status);
         GUI.enabled = !busy;
 
-        if (GUI.Button(new Rect(25f, 85f, 150f, 34f), "Host as Granny"))
+        GUI.Label(new Rect(25f, 67f, 340f, 22f), "Local solo test (no Relay / second copy needed):");
+        if (GUI.Button(new Rect(25f, 88f, 150f, 32f), "Test as Granny"))
+            StartLocalTest(true);
+        if (GUI.Button(new Rect(190f, 88f, 175f, 32f), "Test as Player"))
+            StartLocalTest(false);
+
+        GUI.Label(new Rect(25f, 130f, 340f, 22f), "Online 1v1 (Relay):");
+        if (GUI.Button(new Rect(25f, 152f, 150f, 34f), "Host as Granny"))
             _ = StartHostAsync();
 
-        GUI.Label(new Rect(25f, 132f, 72f, 24f), "Join code:");
-        joinCode = GUI.TextField(new Rect(100f, 129f, 130f, 28f), joinCode, 12).Trim().ToUpperInvariant();
+        GUI.Label(new Rect(25f, 198f, 72f, 24f), "Join code:");
+        joinCode = GUI.TextField(new Rect(100f, 195f, 130f, 28f), joinCode, 12).Trim().ToUpperInvariant();
         GUI.enabled = !busy && !string.IsNullOrWhiteSpace(joinCode);
-        if (GUI.Button(new Rect(240f, 128f, 125f, 30f), "Join as Runner"))
+        if (GUI.Button(new Rect(240f, 194f, 125f, 30f), "Join as Runner"))
             _ = JoinAsync();
         GUI.enabled = true;
 
         if (!string.IsNullOrEmpty(lastError))
-            GUI.Label(new Rect(25f, 166f, 340f, 45f), lastError);
+            GUI.Label(new Rect(25f, 232f, 340f, 45f), lastError);
     }
 
     private void DrawLobby()
@@ -74,7 +81,7 @@ public class RelayConnectionUI : MonoBehaviour
         }
 
         bool matchStarted = localPlayer != null && localPlayer.MatchStarted.Value;
-        float height = matchStarted ? 128f : 285f;
+        float height = matchStarted ? 150f : 285f;
         GUI.Box(new Rect(10f, 10f, 390f, height), matchStarted ? "Online Match" : "Pre-game Lobby — 1 Granny vs 1 Runner");
 
         if (!string.IsNullOrEmpty(joinCode))
@@ -82,8 +89,10 @@ public class RelayConnectionUI : MonoBehaviour
 
         if (matchStarted)
         {
-            GUI.Label(new Rect(25f, 68f, 350f, 24f), localPlayer.IsGranny ? "You are Granny." : "You are the Runner.");
-            if (GUI.Button(new Rect(25f, 95f, 135f, 25f), "Disconnect"))
+            GUI.Label(new Rect(25f, 68f, 350f, 24f), LocalSinglePlayerMode.IsActive
+                ? $"Local solo test: {(localPlayer.IsGranny ? "Granny" : "Player")}."
+                : localPlayer.IsGranny ? "You are Granny." : "You are the Runner.");
+            if (GUI.Button(new Rect(25f, 105f, 135f, 25f), "Disconnect"))
                 Disconnect();
             return;
         }
@@ -193,8 +202,27 @@ public class RelayConnectionUI : MonoBehaviour
         if (networkManager != null && networkManager.IsListening)
             networkManager.Shutdown();
 
+        LocalSinglePlayerMode.Stop();
+
         status = "Disconnected. Host or join a lobby to play.";
         joinCode = "";
+    }
+
+    private void StartLocalTest(bool asGranny)
+    {
+        if (networkManager == null)
+            networkManager = NetworkManager.Singleton;
+
+        if (LocalSinglePlayerMode.Start(networkManager, asGranny))
+        {
+            status = asGranny ? "Starting a local Granny test..." : "Starting a local Player test...";
+            lastError = null;
+        }
+        else
+        {
+            status = "Could not start local test.";
+            lastError = LocalSinglePlayerMode.LastStartError ?? "Check the Unity Console for the transport startup error.";
+        }
     }
 
     private static async Task EnsureServicesAsync()

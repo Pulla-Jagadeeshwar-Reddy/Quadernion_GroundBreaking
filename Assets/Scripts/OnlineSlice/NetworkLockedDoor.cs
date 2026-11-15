@@ -3,8 +3,202 @@ using System.Collections.Generic;
 using UnityEngine;
 
 [RequireComponent(typeof(NetworkObject))]
-public class NetworkLockedDoor : NetworkBehaviour
+public class NetworkLockedDoor : NetworkBehaviour, INetworkInteractable, ISecondaryInteractable
 {
+    // ---------------------------------------------------------------- jamming (Runner F / Granny breaks)
+    private const float JamSeconds = 2.5f;
+    private const float UnjamSeconds = 1f;
+    private const float BreakSeconds = 4f;
+    private const byte HoldNone = 0, HoldJam = 1, HoldUnjam = 2, HoldBreak = 3;
+
+    /// <summary>Jammed shut by the Runner: nobody can open it normally; Granny must break it down.</summary>
+    public NetworkVariable<bool> Jammed = new(false, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+
+    /// <summary>Broken down by Granny this round: cannot be jammed again.</summary>
+    public NetworkVariable<bool> Broken = new(false, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+
+    private ulong holdClient = ulong.MaxValue;
+    private byte holdKind;
+    private double holdStart;
+    private float localPrimaryStart = -1f, localPrimaryDuration;
+    private float localSecondaryStart = -1f, localSecondaryDuration;
+    private GameObject jamVisual;
+
+    private static NetworkPlayerController LocalPlayer
+    {
+        get
+        {
+            Unity.Netcode.NetworkManager manager = Unity.Netcode.NetworkManager.Singleton;
+            return manager != null && manager.LocalClient?.PlayerObject != null
+                ? manager.LocalClient.PlayerObject.GetComponent<NetworkPlayerController>()
+                : null;
+        }
+    }
+
+    private static double ServerNow => Unity.Netcode.NetworkManager.Singleton != null
+        ? Unity.Netcode.NetworkManager.Singleton.ServerTime.Time
+        : Time.timeAsDouble;
+
+    public string GetSecondaryPrompt(NetworkPlayerController player, NetworkInventory inventory)
+    {
+        if (isDuplicateComponent || isDuplicateLeaf || !IsSpawned || player == null || player.IsGranny)
+            return null;
+        if (Jammed.Value)
+            return "Hold F  Unjam door";
+        if (IsOpen.Value || Broken.Value || RequiredItemId != null || requiresTestKey)
+            return null;
+        return "Hold F  Jam door shut (Granny has to break it)";
+    }
+
+    public float SecondaryHoldSeconds => Jammed.Value ? UnjamSeconds : JamSeconds;
+
+    public float GetSecondaryProgress() => localSecondaryStart < 0f || localSecondaryDuration <= 0f
+        ? 0f
+        : Mathf.Clamp01((Time.time - localSecondaryStart) / localSecondaryDuration);
+
+    public void BeginSecondary()
+    {
+        localSecondaryDuration = SecondaryHoldSeconds;
+        localSecondaryStart = Time.time;
+        BeginHoldRpc(Jammed.Value ? HoldUnjam : HoldJam);
+    }
+
+    public void CancelSecondary()
+    {
+        localSecondaryStart = -1f;
+        CancelHoldRpc();
+    }
+
+    [Rpc(SendTo.Server, InvokePermission = RpcInvokePermission.Everyone)]
+    private void BeginHoldRpc(byte kind, RpcParams rpcParams = default)
+    {
+        ulong sender = rpcParams.Receive.SenderClientId;
+        if (!TryGetInRangePlayer(sender, out NetworkPlayerController role))
+            return;
+
+        bool allowed = kind switch
+        {
+            HoldJam => !role.IsGranny && !Jammed.Value && !IsOpen.Value && !Broken.Value && RequiredItemId == null && !requiresTestKey,
+            HoldUnjam => !role.IsGranny && Jammed.Value,
+            HoldBreak => role.IsGranny && Jammed.Value,
+            _ => false,
+        };
+        if (!allowed)
+            return;
+
+        holdClient = sender;
+        holdKind = kind;
+        holdStart = ServerNow;
+        if (kind == HoldJam)
+            RouteManager.Instance?.ServerMakeNoise(LeafCenter, NoiseLevel.Small, "Furniture scraping");
+    }
+
+    [Rpc(SendTo.Server, InvokePermission = RpcInvokePermission.Everyone)]
+    private void CancelHoldRpc(RpcParams rpcParams = default)
+    {
+        if (rpcParams.Receive.SenderClientId == holdClient)
+            holdClient = ulong.MaxValue;
+    }
+
+    private void ServerTickHold()
+    {
+        if (holdClient == ulong.MaxValue)
+            return;
+
+        if (!TryGetInRangePlayer(holdClient, out NetworkPlayerController role) || role.MovementLocked.Value)
+        {
+            holdClient = ulong.MaxValue;
+            return;
+        }
+
+        float duration = holdKind switch
+        {
+            HoldJam => JamSeconds,
+            HoldUnjam => UnjamSeconds,
+            _ => BreakSeconds,
+        };
+        if (ServerNow - holdStart < duration)
+            return;
+
+        byte kind = holdKind;
+        holdClient = ulong.MaxValue;
+        switch (kind)
+        {
+            case HoldJam:
+                if (!IsOpen.Value)
+                    Jammed.Value = true;
+                break;
+            case HoldUnjam:
+                Jammed.Value = false;
+                break;
+            case HoldBreak:
+                Jammed.Value = false;
+                Broken.Value = true;
+                IsOpen.Value = true;
+                DoorBrokenRpc(RoomVolume.NameAt(LeafCenter));
+                break;
+        }
+    }
+
+    [Rpc(SendTo.Everyone)]
+    private void DoorBrokenRpc(Unity.Collections.FixedString64Bytes room)
+    {
+        NetworkPlayerController local = LocalPlayer;
+        if (local != null && !local.IsGranny)
+            RunnerHud.AddToast($"Granny smashed through a jammed door ({room})!", new Color(1f, 0.4f, 0.35f), true);
+    }
+
+    private bool TryGetInRangePlayer(ulong clientId, out NetworkPlayerController role)
+    {
+        role = null;
+        Unity.Netcode.NetworkManager manager = Unity.Netcode.NetworkManager.Singleton;
+        if (manager == null || !manager.ConnectedClients.TryGetValue(clientId, out NetworkClient client) || client.PlayerObject == null)
+            return false;
+
+        role = client.PlayerObject.GetComponent<NetworkPlayerController>();
+        if (role == null || !role.MatchStarted.Value)
+            return false;
+
+        Vector3 position = client.PlayerObject.transform.position;
+        float distance = TryGetLeafBounds(out Bounds leaf)
+            ? Vector3.Distance(position, leaf.ClosestPoint(position))
+            : Vector3.Distance(position, doorLeaf != null ? doorLeaf.position : transform.position);
+        return distance <= serverInteractionRange;
+    }
+
+    private void OnJammedChanged(bool previousValue, bool newValue)
+    {
+        if (newValue)
+        {
+            if (jamVisual == null && TryGetLeafBounds(out Bounds leaf))
+            {
+                // A wooden bar wedged across the doorway, through both sides of the leaf.
+                jamVisual = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                jamVisual.name = "Jam Bar";
+                Destroy(jamVisual.GetComponent<Collider>());
+                bool thinX = leaf.size.x < leaf.size.z;
+                jamVisual.transform.position = new Vector3(leaf.center.x, leaf.min.y + 1.0f, leaf.center.z);
+                jamVisual.transform.localScale = thinX
+                    ? new Vector3(leaf.size.x + 0.25f, 0.12f, leaf.size.z * 0.95f)
+                    : new Vector3(leaf.size.x * 0.95f, 0.12f, leaf.size.z + 0.25f);
+                Renderer bar = jamVisual.GetComponent<Renderer>();
+                Shader lit = Shader.Find("Universal Render Pipeline/Lit");
+                if (lit != null)
+                {
+                    bar.material = new Material(lit);
+                    bar.material.SetColor("_BaseColor", new Color(0.45f, 0.28f, 0.14f));
+                }
+            }
+
+            if (jamVisual != null)
+                jamVisual.SetActive(true);
+        }
+        else if (jamVisual != null)
+        {
+            jamVisual.SetActive(false);
+        }
+    }
+
     private static readonly List<NetworkLockedDoor> SpawnedDoors = new();
     private Renderer[] doorRenderers;
 
@@ -27,6 +221,103 @@ public class NetworkLockedDoor : NetworkBehaviour
         false,
         NetworkVariableReadPermission.Everyone,
         NetworkVariableWritePermission.Server);
+
+    /// <summary>
+    /// Item id needed to open this door while closed (empty = no item lock). Set at runtime by
+    /// route rules (DoorLockRule), so the door setup in the floor scene never needs editing.
+    /// </summary>
+    public NetworkVariable<Unity.Collections.FixedString32Bytes> RequiredItem = new(
+        default,
+        NetworkVariableReadPermission.Everyone,
+        NetworkVariableWritePermission.Server);
+
+    /// <summary>Granny breaking a jammed door is a hold; everything else is a press.</summary>
+    public float HoldSeconds => Jammed.Value && LocalPlayer != null && LocalPlayer.IsGranny ? BreakSeconds : 0f;
+
+    public float GetHoldProgress() => localPrimaryStart < 0f || localPrimaryDuration <= 0f
+        ? 0f
+        : Mathf.Clamp01((Time.time - localPrimaryStart) / localPrimaryDuration);
+
+    public void BeginInteract()
+    {
+        if (Jammed.Value)
+        {
+            if (LocalPlayer != null && LocalPlayer.IsGranny)
+            {
+                localPrimaryDuration = BreakSeconds;
+                localPrimaryStart = Time.time;
+                BeginHoldRpc(HoldBreak);
+            }
+
+            return;
+        }
+
+        InteractRpc();
+    }
+
+    public void CancelInteract()
+    {
+        if (localPrimaryStart >= 0f)
+        {
+            localPrimaryStart = -1f;
+            CancelHoldRpc();
+        }
+    }
+    string INetworkInteractable.GetPrompt(NetworkPlayerController player, NetworkInventory inventory) =>
+        GetInteractionPrompt(player, inventory);
+
+    /// <summary>Approximate centre of the door leaf, for nearest-door lookups.</summary>
+    public Vector3 LeafCenter => TryGetLeafBounds(out Bounds bounds)
+        ? bounds.center
+        : (doorLeaf != null ? doorLeaf.position : transform.position);
+
+    /// <summary>Finds the spawned door whose leaf is closest to a world position.</summary>
+    public static bool TryFindNearest(Vector3 position, float maxDistance, out NetworkLockedDoor door)
+    {
+        door = null;
+        float best = maxDistance;
+        for (int index = SpawnedDoors.Count - 1; index >= 0; index--)
+        {
+            NetworkLockedDoor candidate = SpawnedDoors[index];
+            if (candidate == null)
+            {
+                SpawnedDoors.RemoveAt(index);
+                continue;
+            }
+
+            if (candidate.isDuplicateComponent || candidate.isDuplicateLeaf)
+                continue;
+
+            float distance = Vector3.Distance(position, candidate.LeafCenter);
+            if (distance > best)
+                continue;
+
+            best = distance;
+            door = candidate;
+        }
+
+        return door != null;
+    }
+
+    /// <summary>All currently spawned doors (server uses this to reset a round).</summary>
+    public static IReadOnlyList<NetworkLockedDoor> AllSpawned => SpawnedDoors;
+
+    /// <summary>Server only: close the door and set (or clear) its item lock.</summary>
+    public void ServerSetState(bool open, string requiredItemId)
+    {
+        if (!IsServer)
+            return;
+
+        IsOpen.Value = open;
+        Jammed.Value = false;
+        Broken.Value = false;
+        holdClient = ulong.MaxValue;
+        RequiredItem.Value = string.IsNullOrEmpty(requiredItemId)
+            ? default
+            : new Unity.Collections.FixedString32Bytes(requiredItemId);
+    }
+
+    private string RequiredItemId => RequiredItem.Value.IsEmpty ? null : RequiredItem.Value.ToString();
 
     private Quaternion closedRotation;
     private Quaternion openRotation;
@@ -167,6 +458,9 @@ public class NetworkLockedDoor : NetworkBehaviour
             IsOpen.Value = false;
 
         IsOpen.OnValueChanged += OnOpenChanged;
+        Jammed.OnValueChanged += OnJammedChanged;
+        if (Jammed.Value)
+            OnJammedChanged(false, true);
         if (IsOpen.Value)
             SetBlockersEnabled(false);
         else
@@ -185,7 +479,10 @@ public class NetworkLockedDoor : NetworkBehaviour
             return;
 
         IsOpen.OnValueChanged -= OnOpenChanged;
+        Jammed.OnValueChanged -= OnJammedChanged;
         SpawnedDoors.Remove(this);
+        if (jamVisual != null)
+            Destroy(jamVisual);
     }
 
     public static bool TryFindForCollider(Collider collider, out NetworkLockedDoor door)
@@ -294,7 +591,10 @@ public class NetworkLockedDoor : NetworkBehaviour
         return hasBounds;
     }
 
-    private bool OwnsCollider(Collider collider)
+    /// <summary>True when the Runner can open this door without the old test key (used by the route builder).</summary>
+    public bool OpensWithoutTestKey => !requiresTestKey;
+
+    public bool OwnsCollider(Collider collider)
     {
         if (collider == null)
             return false;
@@ -318,6 +618,9 @@ public class NetworkLockedDoor : NetworkBehaviour
     {
         if (isDuplicateComponent || isDuplicateLeaf)
             return;
+
+        if (IsServer && IsSpawned)
+            ServerTickHold();
 
         if (hingePivot != null)
         {
@@ -355,8 +658,18 @@ public class NetworkLockedDoor : NetworkBehaviour
         if (player.IsGranny && !allowGranny)
             return "Granny cannot use this door";
 
+        if (Jammed.Value)
+            return player.IsGranny ? "Hold E  Break down the jammed door" : "Jammed shut";
+
+        string lockItem = RequiredItemId;
+        if (!IsOpen.Value && lockItem != null && (inventory == null || !inventory.Has(lockItem)))
+            return player.IsGranny ? "E  Open door" : $"Locked — needs {ItemIds.DisplayName(lockItem)}";
+
         if (!IsOpen.Value && requiresTestKey && (inventory == null || !inventory.HasTestKey.Value))
             return "Locked — find the key";
+
+        if (!IsOpen.Value && lockItem != null)
+            return $"E  Unlock with {ItemIds.DisplayName(lockItem)}";
 
         return IsOpen.Value ? "E  Close door" : "E  Open door";
     }
@@ -385,13 +698,22 @@ public class NetworkLockedDoor : NetworkBehaviour
             return;
 
         NetworkPlayerController role = playerObject.GetComponent<NetworkPlayerController>();
-        if (role == null || !role.MatchStarted.Value || (role.IsGranny && !allowGranny))
+        if (role == null || !role.MatchStarted.Value || (role.IsGranny && !allowGranny) || Jammed.Value)
             return;
 
         if (!IsOpen.Value && requiresTestKey)
         {
             NetworkInventory inventory = playerObject.GetComponent<NetworkInventory>();
             if (inventory == null || !inventory.HasTestKey.Value)
+                return;
+        }
+
+        // Granny holds a master key: she can always open route-locked doors to chase the Runner.
+        string lockItem = RequiredItemId;
+        if (!IsOpen.Value && lockItem != null && !role.IsGranny)
+        {
+            NetworkInventory inventory = playerObject.GetComponent<NetworkInventory>();
+            if (inventory == null || !inventory.Has(lockItem))
                 return;
         }
 

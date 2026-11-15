@@ -1,20 +1,29 @@
+using System.Collections.Generic;
 using Unity.Netcode;
 using UnityEngine;
 using UnityEngine.InputSystem;
 
+/// <summary>
+/// Local player's aim-and-press/hold-E interaction, Granny's catch, and the match HUD.
+/// </summary>
 public class NetworkInteractor : NetworkBehaviour
 {
     [SerializeField] private UnityEngine.Camera viewCamera;
     [SerializeField] private float interactionRange = 3.5f;
 
-    private NetworkPickup focusedPickup;
-    private NetworkLockedDoor focusedDoor;
-    private NetworkEscapePoint focusedExit;
+    private INetworkInteractable focused;
+    private INetworkInteractable holding;
+    private ISecondaryInteractable holdingSecondary;
+    private NetworkPlayerController focusedRunner;
+    private NetworkPlayerController player;
+    private NetworkInventory inventory;
 
     private void Awake()
     {
         if (viewCamera == null)
             viewCamera = GetComponentInChildren<UnityEngine.Camera>(true);
+        player = GetComponent<NetworkPlayerController>();
+        inventory = GetComponent<NetworkInventory>();
     }
 
     private void Update()
@@ -22,95 +31,318 @@ public class NetworkInteractor : NetworkBehaviour
         if (!IsSpawned || !IsOwner || viewCamera == null || !viewCamera.enabled)
             return;
 
-        NetworkPlayerController player = GetComponent<NetworkPlayerController>();
-        if (player == null || !player.MatchStarted.Value)
+        if (player == null || !player.MatchStarted.Value || player.MovementLocked.Value)
         {
-            focusedPickup = null;
-            focusedDoor = null;
-            focusedExit = null;
+            StopHolding();
+            StopSecondary();
+            focused = null;
+            EnvInteractionManager.Instance?.ShowFocus(null);
+            focusedRunner = null;
             return;
         }
 
-        focusedPickup = null;
-        focusedDoor = null;
-        focusedExit = null;
+        Keyboard keyboard = Keyboard.current;
+        if (keyboard == null)
+            return;
 
-        Ray viewRay = new Ray(viewCamera.transform.position, viewCamera.transform.forward);
-        if (Physics.Raycast(viewRay, out RaycastHit hit, interactionRange,
-                Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore))
+        // While E (or F) is held on something, keep it focused even if the aim wobbles off its edge;
+        // the server still checks range, and letting go cancels.
+        bool keepHold = holding != null && keyboard.eKey.isPressed && !string.IsNullOrEmpty(holding.GetPrompt(player, inventory));
+        bool keepSecondary = holdingSecondary != null && keyboard.fKey.isPressed;
+        if (keepHold || keepSecondary)
+            focusedRunner = null;
+        if (keepHold)
+            focused = holding;
+        else if (keepSecondary)
+            focused = holdingSecondary as INetworkInteractable;
+        else
+            FindFocus();
+
+        EnvInteractionManager.Instance?.ShowFocus(focused);
+
+        // Granny catches with E or left click when the Runner is in reach.
+        if (player.IsGranny && focusedRunner != null &&
+            (keyboard.eKey.wasPressedThisFrame || (Mouse.current != null && Mouse.current.leftButton.wasPressedThisFrame)))
         {
-            focusedPickup = hit.collider.GetComponentInParent<NetworkPickup>();
-            if (focusedPickup == null)
-                focusedDoor = hit.collider.GetComponentInParent<NetworkLockedDoor>();
-            if (focusedPickup == null && focusedDoor == null)
-                NetworkLockedDoor.TryFindForCollider(hit.collider, out focusedDoor);
-            if (focusedPickup == null && focusedDoor == null)
-                focusedExit = hit.collider.GetComponentInParent<NetworkEscapePoint>();
+            CatchRpc(focusedRunner.NetworkObjectId);
+            return;
         }
 
-        // The first-floor door's blocker is a separate proxy, and approximate wall proxies
-        // can be the first ray hit. Resolve a visible door by its rendered bounds as a fallback.
-        if (focusedPickup == null && focusedDoor == null && focusedExit == null &&
-            NetworkLockedDoor.TryFindAimedDoor(viewRay, transform.position, interactionRange,
-                out NetworkLockedDoor aimedDoor))
-            focusedDoor = aimedDoor;
+        if (holding != null && (focused != holding || !keyboard.eKey.isPressed))
+            StopHolding();
 
-        if (Keyboard.current != null && Keyboard.current.eKey.wasPressedThisFrame)
+        // Secondary action (F), e.g. jamming a door shut.
+        ISecondaryInteractable secondary = focused as ISecondaryInteractable;
+        if (holdingSecondary != null && (secondary != holdingSecondary || !keyboard.fKey.isPressed))
+            StopSecondary();
+        if (secondary != null && keyboard.fKey.wasPressedThisFrame &&
+            !string.IsNullOrEmpty(secondary.GetSecondaryPrompt(player, inventory)))
         {
-            if (focusedPickup != null)
-                focusedPickup.InteractRpc();
-            else if (focusedDoor != null)
-                focusedDoor.InteractRpc();
-            else if (focusedExit != null)
-                focusedExit.InteractRpc();
+            secondary.BeginSecondary();
+            if (secondary.SecondaryHoldSeconds > 0f)
+                holdingSecondary = secondary;
         }
+
+        if (focused == null || !keyboard.eKey.wasPressedThisFrame)
+            return;
+
+        if (string.IsNullOrEmpty(focused.GetPrompt(player, inventory)))
+            return;
+
+        focused.BeginInteract();
+        if (focused.HoldSeconds > 0f)
+            holding = focused;
     }
+
+    private void StopSecondary()
+    {
+        if (holdingSecondary == null)
+            return;
+
+        holdingSecondary.CancelSecondary();
+        holdingSecondary = null;
+    }
+
+    private void StopHolding()
+    {
+        if (holding == null)
+            return;
+
+        holding.CancelInteract();
+        holding = null;
+    }
+
+    private void FindFocus()
+    {
+        focused = null;
+        focusedRunner = null;
+
+        Ray viewRay = new(viewCamera.transform.position, viewCamera.transform.forward);
+        float firstSolid = float.PositiveInfinity;
+        if (Physics.Raycast(viewRay, out RaycastHit hit, interactionRange, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore))
+        {
+            firstSolid = hit.distance;
+            NetworkPlayerController other = hit.collider.GetComponentInParent<NetworkPlayerController>();
+            if (other != null && other != player)
+            {
+                if (player.IsGranny && !other.IsGranny &&
+                    Vector3.Distance(transform.position, other.transform.position) <= CatchRange())
+                    focusedRunner = other;
+                return;
+            }
+
+            focused = ResolveInteractable(hit.collider);
+        }
+
+        // Forgiving aim: items often sit on a desk whose collision box is slightly bigger than the
+        // desk, so the first hit is the desk. Accept an interactable hit just behind the first
+        // solid hit, then try a thin sphere so small items do not need pixel-perfect aim.
+        if (focused == null)
+            focused = FindForgiving(viewRay, 0f) ?? FindForgiving(viewRay, 0.18f);
+
+        // The floor model's own desks, fans and windows (ray-vs-box, no extra colliders).
+        if (focused == null && EnvInteractionManager.Instance != null &&
+            EnvInteractionManager.Instance.TryFindAimed(viewRay, interactionRange, firstSolid, player, inventory,
+                out INetworkInteractable envTarget))
+            focused = envTarget;
+
+        // The first-floor door blocker is a separate proxy, and approximate wall proxies can be the
+        // first ray hit. Resolve a visible door by its rendered bounds as a fallback.
+        if (focused == null &&
+            NetworkLockedDoor.TryFindAimedDoor(viewRay, transform.position, interactionRange, out NetworkLockedDoor aimedDoor))
+            focused = aimedDoor;
+    }
+
+    private static INetworkInteractable ResolveInteractable(Collider collider)
+    {
+        INetworkInteractable found = collider.GetComponentInParent<INetworkInteractable>();
+        if (found == null && NetworkLockedDoor.TryFindForCollider(collider, out NetworkLockedDoor door))
+            found = door;
+        return found;
+    }
+
+    private INetworkInteractable FindForgiving(Ray ray, float radius)
+    {
+        RaycastHit[] hits = radius > 0f
+            ? Physics.SphereCastAll(ray, radius, interactionRange, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore)
+            : Physics.RaycastAll(ray, interactionRange, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
+        if (hits.Length == 0)
+            return null;
+
+        System.Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
+        float firstSolid = float.PositiveInfinity;
+        foreach (RaycastHit candidate in hits)
+        {
+            if (candidate.collider.transform.IsChildOf(transform))
+                continue;
+
+            INetworkInteractable interactable = ResolveInteractable(candidate.collider);
+            if (interactable != null && !string.IsNullOrEmpty(interactable.GetPrompt(player, inventory)))
+            {
+                // Through at most ~0.6 m of furniture box, never through a wall.
+                if (candidate.distance <= firstSolid + 0.6f)
+                    return interactable;
+                return null;
+            }
+
+            if (float.IsPositiveInfinity(firstSolid))
+                firstSolid = candidate.distance;
+        }
+
+        return null;
+    }
+
+    private static float CatchRange() => RouteManager.Instance != null ? RouteManager.Instance.CatchRange : 1.8f;
+
+    [Rpc(SendTo.Server, InvokePermission = RpcInvokePermission.Owner)]
+    private void CatchRpc(ulong runnerObjectId, RpcParams rpcParams = default)
+    {
+        if (player == null || !player.IsGranny || !player.MatchStarted.Value || player.MovementLocked.Value)
+            return;
+
+        if (!NetworkManager.SpawnManager.SpawnedObjects.TryGetValue(runnerObjectId, out NetworkObject target) ||
+            !target.TryGetComponent(out NetworkPlayerController runner) || runner.IsGranny)
+            return;
+
+        // Small allowance for latency on top of the client-side range.
+        if (Vector3.Distance(transform.position, runner.transform.position) > CatchRange() + 0.7f)
+            return;
+
+        RouteManager.Instance?.ServerRunnerCaught(player, runner);
+    }
+
+    // ================================================================ HUD
 
     private void OnGUI()
     {
-        if (!IsSpawned || !IsOwner)
+        if (!IsSpawned || !IsOwner || player == null)
             return;
 
-        NetworkPlayerController player = GetComponent<NetworkPlayerController>();
-        NetworkInventory inventory = GetComponent<NetworkInventory>();
-        if (player != null && player.MatchStarted.Value)
-            DrawMatchHud(player, inventory);
+        if (player.MatchStarted.Value)
+            DrawMatchHud();
+
+        if (player.MovementLocked.Value)
+            return;
 
         string message = null;
-        if (focusedPickup != null)
-            message = "E  Pick up key";
-        else if (focusedDoor != null)
-            message = focusedDoor.GetInteractionPrompt(
-                player, inventory);
-        else if (focusedExit != null)
-            message = "E  Escape";
-
-        if (!string.IsNullOrEmpty(message))
+        float progress = 0f;
+        if (focusedRunner != null)
         {
-            GUI.Box(new Rect(Screen.width * 0.5f - 140f, Screen.height * 0.72f, 280f, 36f), message);
+            message = "E / Click  CATCH!";
+        }
+        else if (focused != null)
+        {
+            message = focused.GetPrompt(player, inventory);
+            progress = focused.GetHoldProgress();
+            if (focused is ISecondaryInteractable secondary)
+            {
+                string extra = secondary.GetSecondaryPrompt(player, inventory);
+                if (!string.IsNullOrEmpty(extra))
+                    message = string.IsNullOrEmpty(message) ? extra : message + "\n" + extra;
+                if (holdingSecondary == secondary)
+                    progress = secondary.GetSecondaryProgress();
+            }
         }
 
+        if (string.IsNullOrEmpty(message))
+            return;
+
+        float boxHeight = message.Contains("\n") ? 52f : 36f;
+        Rect box = new(Screen.width * 0.5f - 210f, Screen.height * 0.72f, 420f, boxHeight);
+        GUI.Box(box, message);
+        if (progress > 0f && focused != null && (focused.HoldSeconds > 0f || holdingSecondary != null))
+        {
+            Rect bar = new(box.x + 8f, box.yMax + 4f, box.width - 16f, 10f);
+            GUI.Box(bar, GUIContent.none);
+            Color previous = GUI.color;
+            GUI.color = new Color(0.35f, 0.85f, 0.45f);
+            GUI.DrawTexture(new Rect(bar.x + 1f, bar.y + 1f, (bar.width - 2f) * progress, bar.height - 2f), Texture2D.whiteTexture);
+            GUI.color = previous;
+        }
+
+        // Crosshair dot.
+        GUI.Box(new Rect(Screen.width * 0.5f - 2f, Screen.height * 0.5f - 2f, 4f, 4f), GUIContent.none);
     }
 
-    private static void DrawMatchHud(NetworkPlayerController player, NetworkInventory inventory)
+    private void DrawMatchHud()
     {
-        const float width = 330f;
-        const float height = 105f;
+        RouteManager routes = RouteManager.Instance;
+        const float width = 380f;
         float x = Screen.width - width - 16f;
-        GUI.Box(new Rect(x, 12f, width, height), player.IsGranny ? "GRANNY" : "RUNNER");
 
         if (player.IsGranny)
         {
-            GUI.Label(new Rect(x + 14f, 40f, width - 28f, 24f), "Stop the Runner from reaching the exit.");
-            GUI.Label(new Rect(x + 14f, 66f, width - 28f, 24f), "Move: WASD    Look: Mouse");
+            GUI.Box(new Rect(x, 12f, width, 136f), "GRANNY");
+            GUI.Label(new Rect(x + 14f, 38f, width - 28f, 22f), "Catch the Runner before they escape. Listen for noises.");
+            GUI.Label(new Rect(x + 14f, 62f, width - 28f, 22f), "Move: WASD   Sprint: Shift   Catch: E / Click");
+            GUI.Label(new Rect(x + 14f, 84f, width - 28f, 22f), "Jammed door? Hold E to break it down.");
+            GUI.Label(new Rect(x + 14f, 106f, width - 28f, 22f), "Running fans hide quiet noises: switch them off.");
             return;
         }
 
-        bool hasKey = inventory != null && inventory.HasTestKey.Value;
-        GUI.Label(new Rect(x + 14f, 38f, width - 28f, 24f),
-            hasKey ? "Test key: Collected" : "Test key: Find it in the room");
-        GUI.Label(new Rect(x + 14f, 62f, width - 28f, 24f),
-            hasKey ? "Next: Open the exit, then escape" : "Goal: Find key → open exit → escape");
-        GUI.Label(new Rect(x + 14f, 83f, width - 28f, 18f), "Move: Arrow keys    Look: Mouse    C: Crouch");
+        if (routes == null)
+        {
+            // Original vertical slice HUD.
+            bool hasKey = inventory != null && inventory.HasTestKey.Value;
+            GUI.Box(new Rect(x, 12f, width, 105f), "RUNNER");
+            GUI.Label(new Rect(x + 14f, 38f, width - 28f, 24f), hasKey ? "Test key: Collected" : "Test key: Find it in the room");
+            GUI.Label(new Rect(x + 14f, 62f, width - 28f, 24f), hasKey ? "Next: Open the exit, then escape" : "Goal: Find key → open exit → escape");
+            GUI.Label(new Rect(x + 14f, 83f, width - 28f, 18f), "Move: Arrow keys    Look: Mouse    C: Crouch");
+            return;
+        }
+
+        RunnerHud.Draw(routes, inventory, player);
+
+        if (Keyboard.current != null && Keyboard.current.tabKey.isPressed)
+            DrawItemFinder();
+    }
+
+    /// <summary>Runner aid: which rooms still have items lying around.</summary>
+    private static void DrawItemFinder()
+    {
+        SortedDictionary<string, List<string>> byRoom = new();
+        foreach (NetworkPickup pickup in NetworkPickup.Active)
+        {
+            if (pickup == null || !pickup.IsSpawned)
+                continue;
+
+            string room = RoomVolume.NameAt(pickup.transform.position);
+            if (!byRoom.TryGetValue(room, out List<string> names))
+                byRoom[room] = names = new List<string>();
+            string name = ItemIds.DisplayName(pickup.ItemId);
+            names.Add(pickup.Count > 1 ? $"{name} x{pickup.Count}" : name);
+        }
+
+        string hiddenRooms = EnvInteractionManager.Instance != null ? EnvInteractionManager.Instance.HiddenRooms.Value.ToString() : "";
+        if (!string.IsNullOrEmpty(hiddenRooms))
+            byRoom["~ In desks"] = new List<string> { hiddenRooms };
+
+        const float width = 380f;
+        float height = 34f + Mathf.Max(1, byRoom.Count) * 22f;
+        Rect panel = new(16f, Screen.height * 0.5f - height * 0.5f, width, height);
+        GUI.Box(panel, "ITEM FINDER — items still lying around");
+        float y = panel.y + 26f;
+        if (byRoom.Count == 0)
+            GUI.Label(new Rect(panel.x + 12f, y, width - 24f, 22f), "Nothing left to pick up.");
+        foreach (KeyValuePair<string, List<string>> room in byRoom)
+        {
+            GUI.Label(new Rect(panel.x + 12f, y, width - 24f, 22f), $"{room.Key}: {string.Join(", ", room.Value)}");
+            y += 22f;
+        }
+    }
+
+    private string DescribeInventory()
+    {
+        if (inventory == null || inventory.Items == null || inventory.Items.Count == 0)
+            return "nothing";
+
+        List<string> parts = new();
+        foreach (InventoryEntry entry in inventory.Items)
+        {
+            string name = ItemIds.DisplayName(entry.Id.ToString());
+            parts.Add(entry.Count > 1 ? $"{name} x{entry.Count}" : name);
+        }
+
+        return string.Join(", ", parts);
     }
 }

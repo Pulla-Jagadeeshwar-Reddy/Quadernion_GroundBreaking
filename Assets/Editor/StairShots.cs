@@ -30,10 +30,17 @@ public static class StairShots
         {
             string n = t.name;
             if (!(n.StartsWith("Barrier - ") || n == "Gold Stair Door" || n == "R2_Shutter (blocker)" ||
-                  n == "Boarded Spots" || n == "R5_ChainLock"))
+                  n == "Boarded Spots" || n == "R5_ChainLock" || n == "R3_LadderSpot"))
                 continue;
 
             Vector3 center = t.position;
+            if (n == "R3_LadderSpot")
+            {
+                // Show the finished ladder.
+                foreach (Transform part in t.GetComponentsInChildren<Transform>(true))
+                    if (part.name.StartsWith("Stage"))
+                        part.gameObject.SetActive(true);
+            }
             string safe = n.Replace(" ", "_").Replace("(", "").Replace(")", "");
 
             // Top-down: walls/floor around the stairwell, blockers visible from above.
@@ -51,7 +58,7 @@ public static class StairShots
                 if (child.GetComponentInChildren<Renderer>() == null)
                     continue;
                 // Blockers face the stairs, so the player stands on the other side.
-                Vector3 back = n == "R5_ChainLock" ? child.forward : -child.forward;
+                Vector3 back = n == "R5_ChainLock" || n == "R3_LadderSpot" ? child.forward : -child.forward;
                 Vector3 eye = child.position + back * 3.5f + Vector3.up * 1.45f;
                 // Step closer until the camera is not inside a wall (no closer than 0.8 m).
                 for (float distance = 3.5f; distance >= 0.8f; distance -= 0.3f)

@@ -53,6 +53,15 @@ public class RouteInteractable : NetworkBehaviour, INetworkInteractable
     public NetworkVariable<float> HoldStartServerTime = new(0f, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
     public NetworkVariable<float> SavedSeconds = new(0f, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
 
+    [Header("Deposits")]
+    [Tooltip("Required items that can be placed here one at a time (fuses, planks, the ice block) instead of carrying them all at once.")]
+    [SerializeField] private string[] depositItemIds = System.Array.Empty<string>();
+    [Tooltip("Shown while anything is placed here and the step is not complete (e.g. the ice block on the bench).")]
+    [SerializeField] private GameObject[] depositVisuals;
+
+    /// <summary>How many of each deposit item (same order as depositItemIds) are already placed here.</summary>
+    private NetworkList<int> deposited;
+
     private readonly List<ItemAmount> bonusGrants = new();
     private float nextHoldNoiseTime;
     private Renderer[] ownRenderers;
@@ -96,6 +105,101 @@ public class RouteInteractable : NetworkBehaviour, INetworkInteractable
         grantedItems = granted;
     }
 
+    /// <summary>Builder setup: items that can be placed here one at a time.</summary>
+    public void ConfigureDeposits(string[] itemIds, GameObject[] visuals = null)
+    {
+        depositItemIds = itemIds ?? System.Array.Empty<string>();
+        depositVisuals = visuals;
+    }
+
+    private int DepositIndex(string itemId)
+    {
+        if (depositItemIds == null)
+            return -1;
+        for (int index = 0; index < depositItemIds.Length; index++)
+        {
+            if (depositItemIds[index] == itemId)
+                return index;
+        }
+
+        return -1;
+    }
+
+    /// <summary>How many of this item are already placed here.</summary>
+    public int DepositedOf(string itemId)
+    {
+        int index = DepositIndex(itemId);
+        return index >= 0 && deposited != null && index < deposited.Count ? deposited[index] : 0;
+    }
+
+    /// <summary>Items toward this step: carried plus already placed here.</summary>
+    public int HaveCount(string itemId, NetworkInventory inventory) =>
+        (inventory != null ? inventory.CountOf(itemId) : 0) + DepositedOf(itemId);
+
+    private bool AnyDeposited()
+    {
+        if (deposited == null)
+            return false;
+        foreach (int count in deposited)
+        {
+            if (count > 0)
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>A deposit item the player carries and this step still needs, or null.</summary>
+    private string PlaceableItem(NetworkInventory inventory)
+    {
+        if (inventory == null || requiredItems == null || depositItemIds == null)
+            return null;
+
+        foreach (ItemAmount item in requiredItems)
+        {
+            if (DepositIndex(item.itemId) < 0)
+                continue;
+            if (DepositedOf(item.itemId) < item.SafeCount && inventory.CountOf(item.itemId) > 0)
+                return item.itemId;
+        }
+
+        return null;
+    }
+
+    /// <summary>Server: move whatever deposit items the player carries (up to what is needed) onto this step.</summary>
+    private bool ServerDeposit(NetworkInventory inventory)
+    {
+        if (inventory == null || requiredItems == null || deposited == null)
+            return false;
+
+        bool placed = false;
+        foreach (ItemAmount item in requiredItems)
+        {
+            int index = DepositIndex(item.itemId);
+            if (index < 0 || index >= deposited.Count)
+                continue;
+
+            int give = Mathf.Min(item.SafeCount - deposited[index], inventory.CountOf(item.itemId));
+            if (give <= 0 || !inventory.ServerTake(item.itemId, give))
+                continue;
+
+            deposited[index] += give;
+            placed = true;
+        }
+
+        return placed;
+    }
+
+    private void ServerClearDeposits()
+    {
+        if (deposited == null || depositItemIds == null)
+            return;
+        while (deposited.Count < depositItemIds.Length)
+            deposited.Add(0);
+        for (int index = 0; index < deposited.Count; index++)
+            deposited[index] = 0;
+    }
+
     public void ConfigureVisuals(GameObject[] show, GameObject[] hide, GameObject[] stages, GameObject[] hints, Collider zone)
     {
         showWhenComplete = show;
@@ -109,6 +213,7 @@ public class RouteInteractable : NetworkBehaviour, INetworkInteractable
     {
         ownRenderers = GetComponentsInChildren<Renderer>(true);
         ownColliders = GetComponentsInChildren<Collider>(true);
+        deposited = new NetworkList<int>();
     }
 
     public override void OnNetworkSpawn()
@@ -116,8 +221,12 @@ public class RouteInteractable : NetworkBehaviour, INetworkInteractable
         if (!All.Contains(this))
             All.Add(this);
 
+        if (IsServer)
+            ServerClearDeposits();
+
         Stage.OnValueChanged += OnStageChanged;
         Active.OnValueChanged += OnActiveChanged;
+        deposited.OnListChanged += OnDepositsChanged;
         ApplyVisuals();
     }
 
@@ -126,7 +235,10 @@ public class RouteInteractable : NetworkBehaviour, INetworkInteractable
         All.Remove(this);
         Stage.OnValueChanged -= OnStageChanged;
         Active.OnValueChanged -= OnActiveChanged;
+        deposited.OnListChanged -= OnDepositsChanged;
     }
+
+    private void OnDepositsChanged(NetworkListEvent<int> change) => ApplyVisuals();
 
     private void OnStageChanged(int previous, int current) => ApplyVisuals();
     private void OnActiveChanged(bool previous, bool current) => ApplyVisuals();
@@ -153,6 +265,7 @@ public class RouteInteractable : NetworkBehaviour, INetworkInteractable
         SetAll(showWhenComplete, complete);
         SetAll(hideWhenComplete, !complete);
         SetAll(availableHints, !complete);
+        SetAll(depositVisuals, !complete && AnyDeposited());
 
         if (stageVisuals != null)
         {
@@ -188,7 +301,13 @@ public class RouteInteractable : NetworkBehaviour, INetworkInteractable
 
         string blocked = GetBlockedReason(player, inventory, player.IsCrouched.Value, true);
         if (blocked != null)
+        {
+            // Still missing something, but carrying a piece that can be placed here now.
+            string placeable = PrerequisitesDone() && DescribeMissing(inventory) != null ? PlaceableItem(inventory) : null;
+            if (placeable != null)
+                return $"E  Place {ItemIds.DisplayName(placeable)} on the {displayName}  (still needs {DescribeMissing(inventory)})";
             return blocked;
+        }
 
         if (IsHeld && HolderClientId.Value != Unity.Netcode.NetworkManager.Singleton.LocalClientId)
             return "Someone is using this";
@@ -241,6 +360,19 @@ public class RouteInteractable : NetworkBehaviour, INetworkInteractable
         return null;
     }
 
+    private bool PrerequisitesDone()
+    {
+        if (prerequisites == null)
+            return true;
+        foreach (RouteInteractable prerequisite in prerequisites)
+        {
+            if (prerequisite != null && !prerequisite.IsCompleted)
+                return false;
+        }
+
+        return true;
+    }
+
     private string DescribeMissing(NetworkInventory inventory)
     {
         if (requiredItems == null || requiredItems.Length == 0)
@@ -252,7 +384,7 @@ public class RouteInteractable : NetworkBehaviour, INetworkInteractable
             if (string.IsNullOrEmpty(item.itemId))
                 continue;
 
-            int have = inventory != null ? inventory.CountOf(item.itemId) : 0;
+            int have = HaveCount(item.itemId, inventory);
             if (have >= item.SafeCount)
                 continue;
 
@@ -285,8 +417,19 @@ public class RouteInteractable : NetworkBehaviour, INetworkInteractable
         if (IsHeld && HolderClientId.Value != sender)
             return;
 
-        if (!TryGetPlayer(sender, out NetworkPlayerController player, out NetworkInventory inventory) ||
-            !CanServerUse(player, inventory))
+        if (!TryGetPlayer(sender, out NetworkPlayerController player, out NetworkInventory inventory))
+            return;
+
+        // Place whatever pieces the player carries (fuses, planks, the ice block) before checking
+        // whether everything is here; if this completes the set, the hold starts right away.
+        if (player.MatchStarted.Value && !player.MovementLocked.Value && !(runnerOnly && player.IsGranny) &&
+            PrerequisitesDone() && DistanceTo(player.transform.position) <= serverInteractionRange &&
+            ServerDeposit(inventory))
+        {
+            PlacedRpc(ItemSummary(), RpcTarget.Single(sender, RpcTargetUse.Temp));
+        }
+
+        if (!CanServerUse(player, inventory))
             return;
 
         if (holdSeconds <= 0f)
@@ -298,6 +441,28 @@ public class RouteInteractable : NetworkBehaviour, INetworkInteractable
         HolderClientId.Value = sender;
         HoldStartServerTime.Value = ServerNow() - SavedSeconds.Value;
         nextHoldNoiseTime = Time.time;
+    }
+
+    private string ItemSummary()
+    {
+        List<string> parts = new();
+        if (requiredItems != null)
+        {
+            foreach (ItemAmount item in requiredItems)
+            {
+                if (DepositIndex(item.itemId) >= 0)
+                    parts.Add($"{ItemIds.DisplayName(item.itemId)} {DepositedOf(item.itemId)}/{item.SafeCount}");
+            }
+        }
+
+        string text = $"Placed on the {displayName}: {string.Join(", ", parts)}";
+        return text.Length > 120 ? text.Substring(0, 120) : text;
+    }
+
+    [Rpc(SendTo.SpecifiedInParams)]
+    private void PlacedRpc(Unity.Collections.FixedString128Bytes text, RpcParams rpcParams)
+    {
+        RunnerHud.AddToast(text.ToString(), new Color(0.75f, 0.9f, 1f));
     }
 
     [Rpc(SendTo.Server, InvokePermission = RpcInvokePermission.Everyone)]
@@ -327,8 +492,18 @@ public class RouteInteractable : NetworkBehaviour, INetworkInteractable
 
         if (ServerNow() - HoldStartServerTime.Value >= holdSeconds)
         {
+            bool finalStep = Stage.Value + 1 >= steps;
+            ulong holder = HolderClientId.Value;
             ServerStopHold(false);
             ServerCompleteStep(player, inventory);
+
+            // Multi-stage steps (the ladder): a player still holding E carries on with the next
+            // stage instead of having to let go and press again. Letting go cancels as usual.
+            if (!finalStep && Active.Value && !IsCompleted && CanServerUse(player, inventory))
+            {
+                HolderClientId.Value = holder;
+                HoldStartServerTime.Value = ServerNow();
+            }
         }
     }
 
@@ -375,10 +550,17 @@ public class RouteInteractable : NetworkBehaviour, INetworkInteractable
         {
             foreach (ItemAmount item in consumedItems)
             {
-                if (!string.IsNullOrEmpty(item.itemId))
-                    inventory.ServerTake(item.itemId, item.SafeCount);
+                if (string.IsNullOrEmpty(item.itemId))
+                    continue;
+                // Pieces already placed here count toward what is used up.
+                int fromInventory = item.SafeCount - DepositedOf(item.itemId);
+                if (fromInventory > 0)
+                    inventory.ServerTake(item.itemId, fromInventory);
             }
         }
+
+        if (finalStep)
+            ServerClearDeposits();
 
         Stage.Value += 1;
         SavedSeconds.Value = 0f;
@@ -421,6 +603,7 @@ public class RouteInteractable : NetworkBehaviour, INetworkInteractable
             return;
 
         bonusGrants.Clear();
+        ServerClearDeposits();
         HolderClientId.Value = ulong.MaxValue;
         SavedSeconds.Value = 0f;
         Stage.Value = 0;

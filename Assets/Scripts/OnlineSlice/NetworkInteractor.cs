@@ -13,6 +13,7 @@ public class NetworkInteractor : NetworkBehaviour
 
     private INetworkInteractable focused;
     private INetworkInteractable holding;
+    private INetworkInteractable lastBegun;
     private ISecondaryInteractable holdingSecondary;
     private NetworkPlayerController focusedRunner;
     private NetworkPlayerController player;
@@ -47,7 +48,10 @@ public class NetworkInteractor : NetworkBehaviour
 
         // While E (or F) is held on something, keep it focused even if the aim wobbles off its edge;
         // the server still checks range, and letting go cancels.
-        bool keepHold = holding != null && keyboard.eKey.isPressed && !string.IsNullOrEmpty(holding.GetPrompt(player, inventory));
+        bool keepHold = holding != null && keyboard.eKey.isPressed && holding.HoldSeconds > 0f &&
+                        !string.IsNullOrEmpty(holding.GetPrompt(player, inventory));
+        if (!keyboard.eKey.isPressed)
+            lastBegun = null;
         bool keepSecondary = holdingSecondary != null && keyboard.fKey.isPressed;
         if (keepHold || keepSecondary)
             focusedRunner = null;
@@ -83,13 +87,18 @@ public class NetworkInteractor : NetworkBehaviour
                 holdingSecondary = secondary;
         }
 
-        if (focused == null || !keyboard.eKey.wasPressedThisFrame)
+        if (focused == null)
             return;
 
-        if (string.IsNullOrEmpty(focused.GetPrompt(player, inventory)))
+        // A fresh press starts anything. Keeping E held and sweeping onto a new hold target starts
+        // that one too, so there is no need to let go and re-press when the aim lands late.
+        bool begin = keyboard.eKey.wasPressedThisFrame ||
+                     (keyboard.eKey.isPressed && holding == null && focused != lastBegun && focused.HoldSeconds > 0f);
+        if (!begin || string.IsNullOrEmpty(focused.GetPrompt(player, inventory)))
             return;
 
         focused.BeginInteract();
+        lastBegun = focused;
         if (focused.HoldSeconds > 0f)
             holding = focused;
     }
@@ -153,11 +162,23 @@ public class NetworkInteractor : NetworkBehaviour
             focused = aimedDoor;
     }
 
-    private static INetworkInteractable ResolveInteractable(Collider collider)
+    private INetworkInteractable ResolveInteractable(Collider collider)
     {
         INetworkInteractable found = collider.GetComponentInParent<INetworkInteractable>();
         if (found == null && NetworkLockedDoor.TryFindForCollider(collider, out NetworkLockedDoor door))
             found = door;
+
+        // A locked exit's hitbox sits in front of the step that unlocks it (ladder build spot,
+        // lift chain): aim at the step it is waiting on instead of the "locked" message.
+        if (found is NetworkEscapePoint exit && !exit.IsUnlocked(inventory) && exit.RequiredCompleted != null)
+        {
+            foreach (RouteInteractable step in exit.RequiredCompleted)
+            {
+                if (step != null && !step.IsCompleted && !string.IsNullOrEmpty(step.GetPrompt(player, inventory)))
+                    return step;
+            }
+        }
+
         return found;
     }
 

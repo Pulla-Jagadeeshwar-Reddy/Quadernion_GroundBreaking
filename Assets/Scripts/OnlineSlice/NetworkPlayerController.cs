@@ -14,16 +14,40 @@ public class NetworkPlayerController : NetworkBehaviour
     [SerializeField] private float gravity = -20f;
     [SerializeField, Range(0.5f, 0.9f)] private float crouchScale = 0.55f;
     [SerializeField, Range(0.2f, 0.8f)] private float crouchSpeedMultiplier = 0.45f;
+    [SerializeField, Range(1f, 2f)] private float sprintMultiplier = 1.6f;
+    [SerializeField] private float cameraCrouchSmoothing = 12f;
+    [SerializeField] private float fallRespawnHeight = -6f;
     [SerializeField] private Vector3 grannySpawn = new(-2f, 1.5f, 0f);
     [SerializeField] private Vector3 runnerSpawn = new(2f, 1.5f, -2f);
 
+    /// <summary>Item ids that stop the Runner from sprinting while carried (heavy items).</summary>
+    public static readonly string[] HeavyItemIds = { "R5_IceBlock" };
+
     private CharacterController characterController;
+    private NetworkInventory inventory;
     private Vector3 standingScale;
     private float verticalSpeed;
     private float pitch;
     private bool cursorLocked;
     private bool isCrouched;
     private Vector3 lastWallNormal;
+    private float cameraBaseLocalY;
+
+    /// <summary>Owner-written crouch state so the server can validate crouch-only interactions.</summary>
+    public NetworkVariable<bool> IsCrouched = new(
+        false,
+        NetworkVariableReadPermission.Everyone,
+        NetworkVariableWritePermission.Owner);
+
+    /// <summary>Set by the server to stop all movement (caught, escaped, round over).</summary>
+    public NetworkVariable<bool> MovementLocked = new(
+        false,
+        NetworkVariableReadPermission.Everyone,
+        NetworkVariableWritePermission.Server);
+
+    public bool IsSprinting { get; private set; }
+    /// <summary>Why Shift is held but sprint is off (null when not relevant). Shown by the HUD.</summary>
+    public string SprintBlockedReason { get; private set; }
 
     public NetworkVariable<bool> IsReady = new(
         false,
@@ -43,14 +67,18 @@ public class NetworkPlayerController : NetworkBehaviour
     private void Awake()
     {
         characterController = GetComponent<CharacterController>();
+        inventory = GetComponent<NetworkInventory>();
         standingScale = transform.localScale;
         if (playerCamera == null)
             playerCamera = GetComponentInChildren<UnityEngine.Camera>(true);
+        if (playerCamera != null)
+            cameraBaseLocalY = playerCamera.transform.localPosition.y;
     }
 
     public override void OnNetworkSpawn()
     {
         MatchStarted.OnValueChanged += OnMatchStartedChanged;
+        MovementLocked.OnValueChanged += OnMovementLockedChanged;
         bool isLocalPlayer = IsOwner;
 
         if (IsServer && LocalSinglePlayerMode.IsActive)
@@ -88,8 +116,21 @@ public class NetworkPlayerController : NetworkBehaviour
     public override void OnNetworkDespawn()
     {
         MatchStarted.OnValueChanged -= OnMatchStartedChanged;
+        MovementLocked.OnValueChanged -= OnMovementLockedChanged;
         if (IsOwner)
             UnlockCursor();
+    }
+
+    private void OnMovementLockedChanged(bool previousValue, bool newValue)
+    {
+        if (!IsOwner)
+            return;
+
+        // Free the mouse for the result screen; take it back when the next round starts.
+        if (newValue)
+            UnlockCursor();
+        else if (MatchStarted.Value)
+            LockCursor();
     }
 
     [Rpc(SendTo.Server, InvokePermission = RpcInvokePermission.Owner)]
@@ -144,6 +185,12 @@ public class NetworkPlayerController : NetworkBehaviour
         if (!IsSpawned || !IsOwner)
             return;
 
+        UpdateCameraHeight();
+
+        // Safety net: anyone who falls out of the level is put back at their spawn.
+        if (transform.position.y < fallRespawnHeight)
+            RespawnAtMarker();
+
         if (!MatchStarted.Value)
             return;
 
@@ -154,7 +201,7 @@ public class NetworkPlayerController : NetworkBehaviour
 
         if (keyboard.escapeKey.wasPressedThisFrame)
             UnlockCursor();
-        if (mouse != null && mouse.leftButton.wasPressedThisFrame)
+        if (mouse != null && mouse.leftButton.wasPressedThisFrame && !MovementLocked.Value)
             LockCursor();
 
         bool wantsToCrouch = keyboard.cKey.isPressed;
@@ -169,9 +216,13 @@ public class NetworkPlayerController : NetworkBehaviour
             playerCamera.transform.localRotation = Quaternion.Euler(pitch, 0f, 0f);
         }
 
+        if (!IsGranny && keyboard.f2Key.wasPressedThisFrame)
+            ControlSettings.RunnerUsesWasd = !ControlSettings.RunnerUsesWasd;
+
+        bool useWasd = IsGranny || ControlSettings.RunnerUsesWasd;
         float forward;
         float sideways;
-        if (IsGranny)
+        if (useWasd)
         {
             forward = Axis(keyboard.wKey.isPressed, keyboard.sKey.isPressed);
             sideways = Axis(keyboard.dKey.isPressed, keyboard.aKey.isPressed);
@@ -182,11 +233,31 @@ public class NetworkPlayerController : NetworkBehaviour
             sideways = Axis(keyboard.rightArrowKey.isPressed, keyboard.leftArrowKey.isPressed);
         }
 
+        if (MovementLocked.Value)
+        {
+            forward = 0f;
+            sideways = 0f;
+        }
+
         Vector3 direction = (transform.forward * forward + transform.right * sideways).normalized;
         if (characterController.isGrounded && verticalSpeed < 0f)
             verticalSpeed = -2f;
 
-        float currentMoveSpeed = isCrouched ? moveSpeed * crouchSpeedMultiplier : moveSpeed;
+        // Either Shift sprints (any forward or diagonal-forward movement).
+        bool sprintKey = keyboard.leftShiftKey.isPressed || keyboard.rightShiftKey.isPressed;
+        bool heavy = IsCarryingHeavyItem();
+        IsSprinting = sprintKey && !isCrouched && forward > 0f && !heavy;
+        SprintBlockedReason = !sprintKey || IsSprinting || direction.sqrMagnitude < 0.01f ? null
+            : heavy ? "Too heavy to sprint (ice block)"
+            : isCrouched ? "Stand up to sprint"
+            : forward <= 0f ? "Sprint only works moving forward"
+            : null;
+
+        float currentMoveSpeed = moveSpeed;
+        if (isCrouched)
+            currentMoveSpeed *= crouchSpeedMultiplier;
+        else if (IsSprinting)
+            currentMoveSpeed *= sprintMultiplier;
         MoveHorizontally(direction * currentMoveSpeed * Time.deltaTime);
 
         verticalSpeed += gravity * Time.deltaTime;
@@ -274,6 +345,75 @@ public class NetworkPlayerController : NetworkBehaviour
         Physics.SyncTransforms();
         characterController.enabled = true;
         isCrouched = crouched;
+        if (IsOwner)
+            IsCrouched.Value = crouched;
+
+        // Keep the eye where it was this frame, then let UpdateCameraHeight ease it to the new height.
+        if (playerCamera != null && !Mathf.Approximately(transform.localScale.y, 0f))
+        {
+            Vector3 local = playerCamera.transform.localPosition;
+            float previousScaleY = standingScale.y * (crouched ? 1f : crouchScale);
+            float worldEyeBefore = (local.y * previousScaleY) - (positionAdjustment.y);
+            local.y = worldEyeBefore / transform.localScale.y;
+            playerCamera.transform.localPosition = local;
+        }
+    }
+
+    private void UpdateCameraHeight()
+    {
+        if (playerCamera == null)
+            return;
+
+        Vector3 local = playerCamera.transform.localPosition;
+        float t = 1f - Mathf.Exp(-cameraCrouchSmoothing * Time.deltaTime);
+        local.y = Mathf.Lerp(local.y, cameraBaseLocalY, t);
+        playerCamera.transform.localPosition = local;
+    }
+
+    private bool IsCarryingHeavyItem()
+    {
+        if (inventory == null)
+            return false;
+
+        foreach (string itemId in HeavyItemIds)
+        {
+            if (inventory.CountOf(itemId) > 0)
+                return true;
+        }
+
+        return false;
+    }
+
+    private void RespawnAtMarker()
+    {
+        string markerName = IsGranny ? "Granny Spawn Marker" : "Player Spawn Marker";
+        Transform marker = GameObject.Find(markerName)?.transform;
+        Vector3 position = marker != null ? marker.position : (IsGranny ? grannySpawn : runnerSpawn);
+        Quaternion rotation = marker != null ? marker.rotation : Quaternion.identity;
+        TeleportLocal(position, rotation);
+    }
+
+    /// <summary>Server-only: teleport this player (owner-authoritative transform, so ask the owner to move).</summary>
+    public void ServerTeleport(Vector3 position, Quaternion rotation)
+    {
+        if (!IsServer)
+            return;
+
+        TeleportOwnerRpc(position, rotation);
+    }
+
+    [Rpc(SendTo.Owner)]
+    private void TeleportOwnerRpc(Vector3 position, Quaternion rotation) => TeleportLocal(position, rotation);
+
+    private void TeleportLocal(Vector3 position, Quaternion rotation)
+    {
+        if (isCrouched)
+            SetCrouched(false);
+        characterController.enabled = false;
+        transform.SetPositionAndRotation(position, rotation);
+        Physics.SyncTransforms();
+        characterController.enabled = true;
+        verticalSpeed = 0f;
     }
 
     private static float Axis(bool positive, bool negative)
@@ -283,6 +423,13 @@ public class NetworkPlayerController : NetworkBehaviour
 
     private void ApplyRoleColor()
     {
+        PlayerAvatar avatar = GetComponent<PlayerAvatar>();
+        if (avatar != null && avatar.HasModels)
+        {
+            avatar.Show(IsGranny, IsOwner);
+            return;
+        }
+
         Renderer[] renderers = GetComponentsInChildren<Renderer>();
         Color roleColor = IsGranny ? new Color(0.65f, 0.12f, 0.12f) : new Color(0.12f, 0.45f, 0.8f);
         foreach (Renderer targetRenderer in renderers)

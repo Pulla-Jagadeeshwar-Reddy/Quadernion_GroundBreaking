@@ -1,0 +1,11 @@
+{
+    "spots": [
+        { "x": -11, "z": 17, "kind": "boards", "note": "" },
+        { "x": 7, "z": 17, "kind": "boards", "note": "" },
+        { "x": 10, "z": -1, "kind": "boards", "note": "behind the staff room cabinet" },
+        { "x": -54, "z": 2, "kind": "boards", "note": "" },
+        { "x": -51, "z": 16, "kind": "boards", "note": "" },
+        { "x": 4, "z": -4, "kind": "gold", "note": "Locksmith gold door" },
+        { "x": -23, "z": -10, "kind": "shutter", "note": "Blackout power shutter" }
+    ]
+}

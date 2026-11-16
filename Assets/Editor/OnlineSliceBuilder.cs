@@ -50,6 +50,11 @@ public static class OnlineSliceBuilder
 
     private static GameObject BuildPlayerPrefab()
     {
+        // Never overwrite the tuned player prefab (height, crouch, camera); only create it when missing.
+        GameObject existing = AssetDatabase.LoadAssetAtPath<GameObject>(PrefabPath);
+        if (existing != null)
+            return existing;
+
         GameObject player = GameObject.CreatePrimitive(PrimitiveType.Capsule);
         player.name = "OnlinePlayer";
         Object.DestroyImmediate(player.GetComponent<CapsuleCollider>());

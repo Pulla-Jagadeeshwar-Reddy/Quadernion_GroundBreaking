@@ -192,6 +192,7 @@ public static class RouteSceneBuilder
         Physics.SyncTransforms();
         grid = WalkGrid.Build(root.transform);
         stairLog.Clear();
+        stairBoardCenters.Clear();
         Transform barriers = Child(root.transform, "Stair Barriers");
         foreach (StairSpec stair in SealedStairs)
             BuildStairBarrier(barriers, stair, materials, "Barrier - " + stair.Name);
@@ -325,11 +326,9 @@ public static class RouteSceneBuilder
         // step 2 opens the padlock with the key and the passcode.
         RouteInteractable stairDoor = NewStep(parent, "R1_StairDoor", Flat(StairsLocksmith.Center), warnings, snap: false);
         GameObject barrier = BuildStairBarrier(stairDoor.transform, StairsLocksmith, materials, "Gold Stair Door", StairBlock.GoldDoor);
-        GameObject padlock = Box("Padlock", new Vector3(0.3f, 0.35f, 0.3f), new Vector3(0f, 1.0f, 0f), materials.Brass);
-        padlock.transform.SetParent(barrier.transform, true);
-        Object.DestroyImmediate(padlock.GetComponent<Collider>());
         stairDoor.Configure("R1_StairDoor", route, "Boarded Stair Door", "Open", 6.5f, 2, false, NoiseLevel.Small, NoiseLevel.Small,
-            null, Items((ItemIds.Screwdriver, 1), (ItemIds.R1DoorKey, 1), (ItemIds.R1Passcode, 1)), null, null);
+            null, Items((ItemIds.Screwdriver, 1), (ItemIds.R1DoorKey, 1), (ItemIds.R1Passcode, 1)),
+            Items((ItemIds.R1DoorKey, 1), (ItemIds.R1Passcode, 1)), null);
         stairDoor.ConfigureVisuals(null, new[] { barrier }, null, null, null);
 
         BuildExit(parent, "Exit - Locksmith", Flat(StairsLocksmith.Center), route, new[] { stairDoor },
@@ -379,6 +378,7 @@ public static class RouteSceneBuilder
 
         GameObject shutter = BuildStairBarrier(parent, StairsBlackout, materials, "R2_Shutter (blocker)", StairBlock.Shutter);
         panel.ConfigureVisuals(fuseParts, new[] { shutter }, null, ledParts, null);
+        panel.ConfigureDeposits(new[] { ItemIds.R2Fuse });
 
         BuildExit(parent, "Exit - Blackout", Flat(StairsBlackout.Center), route, new[] { panel },
             "Power shutter is down", materials);
@@ -472,17 +472,89 @@ public static class RouteSceneBuilder
         RouteInteractable ladder = NewStep(parent, "R3_LadderSpot", edge, warnings, snap: false);
         ladder.transform.rotation = Quaternion.LookRotation(outward, Vector3.up);
         GameObject[] stages = new GameObject[3];
+        Vector3 exitPoint = ladder.transform.position + ladder.transform.forward * 0.45f;
         string ladderPath = $"{RoutesRoot}/Route03_Hacker/Models/R3_Ladder.fbx";
         if (File.Exists(ladderPath))
         {
             // Plank pile at the build spot (Base) and three ladder sections that appear as it is built.
             GameObject ladderModel = AddModel(ladder.transform, "Route03_Hacker", "R3_Ladder", () => new GameObject("R3_Ladder"));
-            ladderModel.transform.localPosition = new Vector3(0f, 0f, 0.45f);
+            // The model's origin is the top of the railing and the ladder hangs straight down from
+            // there: find the railing and the slab edge in front of the spot and hang it just past both.
+            // The collision floor covers the atrium and the railing has no collision at bar height,
+            // so measure against the visible meshes: temporary mesh colliders on a separate layer.
+            Vector3 floor = ladder.transform.position;
+            float railDistance = 0.45f, railTop = 1.0f, edgeDistance = 0.45f;
+            const int probeLayer = 31;
+            List<GameObject> probes = new();
+            Bounds near = new(floor + outward * 1.5f, new Vector3(5f, 6f, 5f));
+            foreach (MeshFilter filter in Object.FindObjectsByType<MeshFilter>(FindObjectsInactive.Exclude))
+            {
+                Renderer renderer = filter.GetComponent<Renderer>();
+                if (filter.sharedMesh == null || renderer == null || !renderer.bounds.Intersects(near) ||
+                    filter.transform.root.name == ContentRootName || filter.GetComponentInParent<NetworkObject>() != null)
+                    continue;
+                GameObject probe = new("Ladder Probe") { layer = probeLayer };
+                probe.transform.SetPositionAndRotation(filter.transform.position, filter.transform.rotation);
+                probe.transform.localScale = filter.transform.lossyScale;
+                probe.AddComponent<MeshCollider>().sharedMesh = filter.sharedMesh;
+                probes.Add(probe);
+            }
+
+            Physics.SyncTransforms();
+            int mask = 1 << probeLayer;
+            float nearestRail = float.MaxValue;
+            foreach (float height in new[] { 0.5f, 0.7f, 0.9f, 1.0f })
+            foreach (float side in new[] { -0.4f, -0.2f, 0f, 0.2f, 0.4f })
+            {
+                Vector3 from = floor + Vector3.up * height + Vector3.Cross(Vector3.up, outward) * side;
+                if (Physics.Raycast(from, outward, out RaycastHit rail, 3f, mask, QueryTriggerInteraction.Ignore) && rail.distance < nearestRail)
+                    nearestRail = rail.distance;
+            }
+
+            if (nearestRail < float.MaxValue)
+            {
+                railDistance = nearestRail;
+                for (float y = 1.6f; y >= 0.3f; y -= 0.02f)
+                {
+                    // Highest point of the railing just in front of the spot.
+                    if (Physics.CheckBox(floor + outward * (railDistance + 0.04f) + Vector3.up * y, new Vector3(0.6f, 0.01f, 0.06f),
+                            Quaternion.LookRotation(outward), mask, QueryTriggerInteraction.Ignore))
+                    {
+                        railTop = y;
+                        break;
+                    }
+                }
+            }
+
+            for (float d = 0.1f; d <= 3f; d += 0.04f)
+            {
+                if (!Physics.Raycast(floor + outward * d + Vector3.up * 0.3f, Vector3.down, 0.7f, mask, QueryTriggerInteraction.Ignore))
+                {
+                    edgeDistance = d;
+                    break;
+                }
+            }
+
+            foreach (GameObject probe in probes)
+                Object.DestroyImmediate(probe);
+            Physics.SyncTransforms();
+
+            float hang = Mathf.Max(edgeDistance, railDistance) + 0.06f;
+            ladderModel.transform.position = floor + outward * hang + Vector3.up * railTop;
+            exitPoint = floor + outward * hang;
+            warnings.Add($"R3_Ladder: railing {railDistance:0.00} m out (top {railTop:0.00} m), slab edge {edgeDistance:0.00} m out.");
+
             for (int stage = 0; stage < 3; stage++)
                 stages[stage] = FindChildren(ladderModel.transform, $"Stage{stage + 1}").FirstOrDefault();
             GameObject[] baseParts = FindChildren(ladderModel.transform, "Base");
             if (baseParts.Length > 0)
+            {
+                // The plank pile (the build site) lies on the floor on this side of the railing.
+                Bounds pile = RendererBounds(baseParts[0], floor);
+                Vector3 target = floor - outward * 0.5f + Vector3.up * pile.extents.y;
+                baseParts[0].transform.position += target - pile.center;
                 EnsureCollider(baseParts[0]);
+            }
         }
         else
         {
@@ -503,9 +575,10 @@ public static class RouteSceneBuilder
             null, Items((ItemIds.R3Plank, 8), (ItemIds.R3Nails, 1), (ItemIds.Hammer, 1)),
             Items((ItemIds.R3Plank, 8), (ItemIds.R3Nails, 1)), null);
         ladder.ConfigureVisuals(null, null, stages, null, null);
+        ladder.ConfigureDeposits(new[] { ItemIds.R3Plank, ItemIds.R3Nails });
 
         // The escape is the ladder itself: aim at it (or walk onto it) once it is built.
-        BuildExit(parent, "Exit - Ladder", ladder.transform.position + ladder.transform.forward * 0.45f, route, new[] { ladder },
+        BuildExit(parent, "Exit - Ladder", exitPoint, route, new[] { ladder },
             "Build the ladder first", materials, ladderExit: true);
         return pcs.ToArray();
     }
@@ -540,6 +613,14 @@ public static class RouteSceneBuilder
             EnsureCollider(benchVisual);
             bench.Configure($"R5_SmashBench_{index + 1}", route, "Workbench", "Smash the ice on", 6f, 1, false, NoiseLevel.Loud, NoiseLevel.None,
                 null, Items((ItemIds.R5IceBlock, 1), (ItemIds.Hammer, 1)), Items((ItemIds.R5IceBlock, 1)), Items((ItemIds.R5BellKey, 1)));
+            // The ice block can be set down on the bench first and smashed once the hammer is found.
+            Bounds benchBounds = RendererBounds(benchVisual, bench.transform.position);
+            GameObject ice = Box("Placed Ice Block", new Vector3(0.35f, 0.3f, 0.35f), Vector3.zero, materials.Ice);
+            ice.transform.SetParent(bench.transform, false);
+            ice.transform.position = new Vector3(benchBounds.center.x, benchBounds.max.y + 0.15f, benchBounds.center.z);
+            Object.DestroyImmediate(ice.GetComponent<Collider>());
+            ice.SetActive(false);
+            bench.ConfigureDeposits(new[] { ItemIds.R5IceBlock }, new[] { ice });
             benchCandidates.Add(bench);
         }
 
@@ -1201,14 +1282,23 @@ public static class RouteSceneBuilder
         barrier.transform.position = stair.Center;
         BoxCollider blocker = barrier.AddComponent<BoxCollider>();
         blocker.size = stair.Size;
+        blocker.enabled = false;                 // off while the entrance is searched (it fills the stairwell)
+        Physics.SyncTransforms();
 
         string spotKind = kind == StairBlock.GoldDoor ? "gold" : kind == StairBlock.Shutter ? "shutter" : null;
-        List<(Vector3 center, Vector3 facing, float width)> listed = spotKind == null ? new()
-            : ExtraBoards.Load().Where(spot => spot.kind == spotKind).Select(ExtraBoards.Fit)
+        List<(Vector3 center, Vector3 facing, float width)> listed = spotKind != null
+            ? ExtraBoards.Load().Where(spot => spot.kind == spotKind).Select(ExtraBoards.Fit).ToList()
+            // Sealed stairs: hand-placed entrances ("stairs" spots) belong to their nearest sealed stairwell.
+            : ExtraBoards.Load()
+                .Where(spot => spot.kind == "stairs" && NearestSealedStair(new Vector3(spot.x, 0f, spot.z)) == stair.Name)
+                .Select(ExtraBoards.FitPassage)
+                // Back of the boards towards the stairwell, front towards the player.
+                .Select(fit => (fit.center, Vector3.Dot(Flat(stair.Center) - Flat(fit.center), fit.facing) >= 0f ? fit.facing : -fit.facing, fit.width))
                 .ToList();
         List<(Vector3 center, Vector3 facing, float width)> placements = listed.Count > 0 ? listed
             : StairBlockerStore.TryGet(name, out var saved) ? saved
             : FindStairEntrances(stair);
+        blocker.enabled = true;
         foreach ((Vector3 center, Vector3 facing, float width) in placements)
         {
             GameObject visual = kind switch
@@ -1218,6 +1308,7 @@ public static class RouteSceneBuilder
                 _ => BoardPanel("Boards", center, facing, width, materials, true),
             };
             visual.transform.SetParent(barrier.transform, true);
+            stairBoardCenters.Add(center);
             stairLog.AppendLine($"{name}: {kind} at ({center.x:0.0}, {center.z:0.0}) width {width:0.0} m facing ({facing.x:0}, {facing.z:0})");
         }
 
@@ -1226,6 +1317,24 @@ public static class RouteSceneBuilder
     }
 
     private static readonly System.Text.StringBuilder stairLog = new();
+    private static readonly List<Vector3> stairBoardCenters = new();
+
+    private static string NearestSealedStair(Vector3 point)
+    {
+        string best = null;
+        float bestDistance = float.MaxValue;
+        foreach (StairSpec stair in SealedStairs)
+        {
+            float distance = Vector3.Distance(Flat(stair.Center), Flat(point));
+            if (distance < bestDistance)
+            {
+                bestDistance = distance;
+                best = stair.Name;
+            }
+        }
+
+        return best;
+    }
 
     /// <summary>
     /// Every side of a stairwell that players can walk up to (from the walk grid; the most open side
@@ -1236,6 +1345,17 @@ public static class RouteSceneBuilder
     {
         List<(Vector3 center, Vector3 facing, float width)> result = new();
         Physics.SyncTransforms();
+
+        // Preferred: wherever reachable floor walks straight off onto these stairs.
+        if (grid != null)
+        {
+            Bounds flights = new(new Vector3((stair.MinX + stair.MaxX) * 0.5f, 0f, (stair.MinZ + stair.MaxZ) * 0.5f),
+                new Vector3(stair.MaxX - stair.MinX, 10f, stair.MaxZ - stair.MinZ));
+            List<(Vector3 center, Vector3 facing, float width)> drops = grid.FindDropEdges(flights);
+            if (drops.Count > 0)
+                return drops;
+        }
+
         var sides = StairSides(stair);
         foreach (int side in StairEntranceSides(stair))
         {
@@ -1273,9 +1393,7 @@ public static class RouteSceneBuilder
         for (int index = 0; index < sides.Length; index++)
         {
             Vector3 probe = sides[index].point + sides[index].outward * 0.4f;
-            bool walled = Physics.Raycast(sides[index].point - sides[index].outward * 0.35f, sides[index].outward, 0.9f,
-                Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
-            if (!walled && ReachDistance(new Vector3(probe.x, 0f, probe.z)) <= 0.7f)
+            if (ReachDistance(new Vector3(probe.x, 0f, probe.z)) <= 0.7f && IsWalkableStairEdge(sides[index].point, sides[index].outward, sides[index].length))
                 reachable.Add(index);
         }
 
@@ -1296,6 +1414,54 @@ public static class RouteSceneBuilder
         }
 
         return new List<int> { open };
+    }
+
+    /// <summary>
+    /// Can a player actually step from the floor onto the stairs across this side? True only where,
+    /// at some point along the side, nothing blocks at knee, waist or head height (railings and
+    /// walls fail) and the surface just inside the stairwell is at floor level (the top step, not
+    /// the drop down the back of the stairs).
+    /// </summary>
+    private static bool IsWalkableStairEdge(Vector3 sidePoint, Vector3 outward, float sideLength)
+    {
+        Vector3 along = Vector3.Cross(Vector3.up, outward);
+        float floorY = Physics.Raycast(new Vector3(sidePoint.x, 1f, sidePoint.z) + outward * 0.5f, Vector3.down, out RaycastHit floorHit, 2.5f,
+            Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore) ? floorHit.point.y : 0f;
+
+        int samples = Mathf.Max(3, Mathf.CeilToInt(sideLength / 0.4f));
+        int open = 0;
+        for (int sample = 0; sample < samples; sample++)
+        {
+            float t = (sample + 0.5f) / samples - 0.5f;
+            Vector3 at = new Vector3(sidePoint.x, floorY, sidePoint.z) + along * (t * (sideLength - 0.4f));
+
+            bool blocked = false;
+            foreach (float height in new[] { 0.45f, 0.8f, 1.2f, 1.7f })
+            {
+                Vector3 from = at + outward * 0.6f + Vector3.up * height;
+                if (Physics.Raycast(from, -outward, 1.2f, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore))
+                {
+                    blocked = true;
+                    break;
+                }
+            }
+
+            if (blocked)
+                continue;
+
+            // Just inside the stairwell: the top step sits at about floor level; the back of the
+            // stairs drops away (or has nothing under it).
+            Vector3 inside = at - outward * 0.5f + Vector3.up * 1.5f;
+            if (!Physics.Raycast(inside, Vector3.down, out RaycastHit stepHit, 4f, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore))
+                continue;
+            if (stepHit.point.y < floorY - 0.45f || stepHit.point.y > floorY + 0.45f)
+                continue;
+
+            open++;
+        }
+
+        // A real entrance is at least about a player's width of open, level edge.
+        return open * (sideLength / samples) >= 0.9f;
     }
 
     /// <summary>
@@ -1438,6 +1604,29 @@ public static class RouteSceneBuilder
             bool frontOk = front <= 0.6f, backOk = back <= 0.6f;
             if (frontOk == backOk)
                 return;                                   // both sides usable, or neither: leave it
+
+            // Listed as a real room in extra_boards.json ("open"): never board or lock it.
+            if (ExtraBoards.Load().Any(spot => spot.kind == "open" &&
+                                               Vector2.Distance(new Vector2(spot.x, spot.z), new Vector2(leaf.center.x, leaf.center.z)) < 1.5f))
+            {
+                log.AppendLine($"(kept open by extra_boards.json) {what} at ({leaf.center.x:0.0}, {leaf.center.z:0.0})");
+                return;
+            }
+
+            // Already boarded as a sealed stair entrance: just lock it, no second set of boards.
+            if (stairBoardCenters.Any(board => Vector3.Distance(Flat(board), Flat(leaf.center)) < 1.0f))
+            {
+                if (lockDoor)
+                {
+                    GameObject stairLock = new($"Boarded Door Lock {count + 1}");
+                    stairLock.transform.SetParent(parent, false);
+                    stairLock.transform.position = leaf.center;
+                    stairLock.AddComponent<DoorLockRule>().Configure(ItemIds.Boarded, 1.0f);
+                }
+
+                log.AppendLine($"(stair boards already cover) {what} at ({leaf.center.x:0.0}, {leaf.center.z:0.0})");
+                return;
+            }
 
             Vector3 side = frontOk ? normal : -normal;
             float width = (thinX ? leaf.size.z : leaf.size.x) + 0.3f;
@@ -1845,6 +2034,202 @@ public static class RouteSceneBuilder
                     queue.Enqueue(next);
                 }
             }
+        }
+
+        /// <summary>
+        /// Where reachable floor walks straight off onto the stairs (or the stair hole) inside
+        /// <paramref name="area"/>: a reachable cell whose neighbour has no floor at floor level and
+        /// nothing in the way at body height. Neighbouring edge cells facing the same way are merged
+        /// into one opening. Returns each opening's floor centre (on the edge), the direction toward
+        /// the stairs and its width.
+        /// </summary>
+        /// <summary>
+        /// No floor at floor level here: stair collision, a drop, or nothing at all.
+        /// </summary>
+        private static bool IsStairOrWell(Vector3 cell)
+        {
+            if (!Physics.Raycast(new Vector3(cell.x, 2.4f, cell.z), Vector3.down, out RaycastHit hit, 3.2f,
+                    Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore))
+                return true;
+            return hit.point.y < -0.3f || IsStairCollider(hit.collider);
+        }
+
+        private static bool IsStairCollider(Collider collider)
+        {
+            for (Transform current = collider.transform; current != null; current = current.parent)
+            {
+                if (current.name.StartsWith("Collision - Stairs") || current.name.StartsWith("Stairs"))
+                    return true;
+            }
+
+            return false;
+        }
+
+        public List<(Vector3 center, Vector3 facing, float width)> FindDropEdges(Bounds stairBounds)
+        {
+            int[] dx = { 1, -1, 0, 0 };
+            int[] dz = { 0, 0, 1, -1 };
+            int total = countX * countZ;
+
+            // 1) The whole stairwell: cells over the stair flights, grown through connected cells
+            //    with no floor at floor level (stair collision, or the open well in front of it).
+            bool[] well = new bool[total];
+            Queue<int> queue = new();
+            Bounds limit = stairBounds;
+            limit.Expand(new Vector3(12f, 0f, 12f));         // the open well in front of the flights, not the outside
+            for (int x = 0; x < countX; x++)
+            for (int z = 0; z < countZ; z++)
+            {
+                Vector3 c = CellCenter(x, z);
+                int index = x * countZ + z;
+                if (walkable[index] || c.x < stairBounds.min.x || c.x > stairBounds.max.x || c.z < stairBounds.min.z || c.z > stairBounds.max.z)
+                    continue;
+                well[index] = true;
+                queue.Enqueue(index);
+            }
+
+            while (queue.Count > 0)
+            {
+                int current = queue.Dequeue();
+                int cx = current / countZ, cz = current % countZ;
+                for (int dir = 0; dir < 4; dir++)
+                {
+                    int nx = cx + dx[dir], nz = cz + dz[dir];
+                    if (nx < 0 || nz < 0 || nx >= countX || nz >= countZ)
+                        continue;
+                    int next = nx * countZ + nz;
+                    if (well[next] || walkable[next])
+                        continue;
+                    Vector3 n = CellCenter(nx, nz);
+                    if (n.x < limit.min.x || n.x > limit.max.x || n.z < limit.min.z || n.z > limit.max.z)
+                        continue;
+                    if (!IsStairOrWell(n))
+                        continue;
+                    well[next] = true;
+                    queue.Enqueue(next);
+                }
+            }
+
+            // 2) Reachable floor cells that step straight into the well, nothing in between.
+            List<(int x, int z, int dir)> edges = new();
+            for (int x = 0; x < countX; x++)
+            for (int z = 0; z < countZ; z++)
+            {
+                int index = x * countZ + z;
+                if (!reachable[index])
+                    continue;
+                Vector3 c = CellCenter(x, z);
+                for (int dir = 0; dir < 4; dir++)
+                {
+                    int nx = x + dx[dir], nz = z + dz[dir];
+                    if (nx < 0 || nz < 0 || nx >= countX || nz >= countZ || !well[nx * countZ + nz])
+                        continue;
+
+                    Vector3 from = new(c.x, floorY[index], c.z);
+                    bool blocked = false;
+                    foreach (float height in new[] { 0.45f, 0.9f, 1.4f })
+                    {
+                        foreach (RaycastHit block in Physics.RaycastAll(from + Vector3.up * height, new Vector3(dx[dir], 0f, dz[dir]), Cell,
+                                     Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore))
+                        {
+                            if (!IsStairCollider(block.collider))
+                            {
+                                blocked = true;
+                                break;
+                            }
+                        }
+
+                        if (blocked)
+                            break;
+                    }
+
+                    if (!blocked)
+                        edges.Add((x, z, dir));
+                }
+            }
+
+            // Merge edges facing the same way that touch (within one cell).
+            List<(Vector3 center, Vector3 facing, float width)> openings = new();
+            bool[] used = new bool[edges.Count];
+            for (int start = 0; start < edges.Count; start++)
+            {
+                if (used[start])
+                    continue;
+
+                List<(int x, int z, int dir)> group = new() { edges[start] };
+                used[start] = true;
+                for (int cursor = 0; cursor < group.Count; cursor++)
+                {
+                    for (int other = 0; other < edges.Count; other++)
+                    {
+                        if (used[other] || edges[other].dir != group[cursor].dir)
+                            continue;
+                        if (Mathf.Abs(edges[other].x - group[cursor].x) <= 1 && Mathf.Abs(edges[other].z - group[cursor].z) <= 1)
+                        {
+                            used[other] = true;
+                            group.Add(edges[other]);
+                        }
+                    }
+                }
+
+                if (group.Count < 2)
+                    continue;                                   // a single cell is a corner nick, not a way in
+
+                int d = group[0].dir;
+                Vector3 facing = new(dx[d], 0f, dz[d]);
+                bool alongX = dz[d] != 0;                       // the opening runs across the facing
+                float min = float.MaxValue, max = float.MinValue, line = 0f, ySum = 0f;
+                foreach ((int x, int z, int _) in group)
+                {
+                    Vector3 c = CellCenter(x, z);
+                    float across = alongX ? c.x : c.z;
+                    min = Mathf.Min(min, across);
+                    max = Mathf.Max(max, across);
+                    line += alongX ? c.z : c.x;
+                    ySum += floorY[x * countZ + z];
+                }
+
+                line /= group.Count;
+                float mid = (min + max) * 0.5f;
+                float edgeLine = line + (alongX ? dz[d] : dx[d]) * Cell * 0.5f;
+                Vector3 center = alongX ? new Vector3(mid, ySum / group.Count, edgeLine) : new Vector3(edgeLine, ySum / group.Count, mid);
+                openings.Add((center, facing, max - min + Cell + 0.3f));
+            }
+
+            // One entrance split by a post or frame: join pieces facing the same way on the same line.
+            for (bool merged = true; merged;)
+            {
+                merged = false;
+                for (int i = 0; i < openings.Count && !merged; i++)
+                for (int j = i + 1; j < openings.Count && !merged; j++)
+                {
+                    var a = openings[i];
+                    var b = openings[j];
+                    if (Vector3.Dot(a.facing, b.facing) < 0.99f)
+                        continue;
+                    bool alongX = Mathf.Abs(a.facing.z) > 0.5f;
+                    float lineA = alongX ? a.center.z : a.center.x, lineB = alongX ? b.center.z : b.center.x;
+                    if (Mathf.Abs(lineA - lineB) > 0.3f)
+                        continue;
+                    float midA = alongX ? a.center.x : a.center.z, midB = alongX ? b.center.x : b.center.z;
+                    float minA = midA - a.width * 0.5f, maxA = midA + a.width * 0.5f;
+                    float minB = midB - b.width * 0.5f, maxB = midB + b.width * 0.5f;
+                    float gap = Mathf.Max(minA, minB) - Mathf.Min(maxA, maxB);
+                    if (gap > 0.9f)
+                        continue;
+                    float min = Mathf.Min(minA, minB), max = Mathf.Max(maxA, maxB), mid = (min + max) * 0.5f, line = (lineA + lineB) * 0.5f;
+                    Vector3 center = alongX ? new Vector3(mid, a.center.y, line) : new Vector3(line, a.center.y, mid);
+                    openings[i] = (center, a.facing, max - min);
+                    openings.RemoveAt(j);
+                    merged = true;
+                }
+            }
+
+            // Wider than any stair passage, or looking out of the building (nothing across the
+            // "well" for 25 m): the flood ran out along the outside of the building.
+            openings.RemoveAll(opening => opening.width > 5.2f ||
+                !Physics.Raycast(opening.center + Vector3.up * 1.2f, opening.facing, 25f, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore));
+            return openings;
         }
 
         /// <summary>
@@ -2287,6 +2672,7 @@ public static class RouteSceneBuilder
         public readonly Material DarkMetal = Make("M_Route_DarkMetal", new Color(0.16f, 0.17f, 0.19f), 0.4f, 0.6f);
         public readonly Material Brass = Make("M_Route_Brass", new Color(0.85f, 0.65f, 0.25f), 0.3f, 0.9f);
         public readonly Material White = Make("M_Route_White", new Color(0.9f, 0.92f, 0.95f), 0.5f);
+        public readonly Material Ice = Make("M_Route_Ice", new Color(0.7f, 0.88f, 1f), 0.1f);
         public readonly Material Barricade = Make("M_Route_Barricade", new Color(0.35f, 0.28f, 0.2f), 0.85f);
         public readonly Material Shutter = Make("M_Route_Shutter", new Color(0.45f, 0.48f, 0.5f), 0.45f, 0.7f);
         public readonly Material Hazard = Make("M_Route_Hazard", new Color(0.95f, 0.75f, 0.1f), 0.6f, 0f, new Color(0.25f, 0.18f, 0f));

@@ -10,7 +10,8 @@ using UnityEngine;
 ///   locked as "Boarded up");
 /// - otherwise the narrowest gap within 1.2 m of the spot.
 /// { "spots": [ { "x": 12.5, "z": 7.0, "kind": "boards", "note": "behind the staff room cabinet" } ] }
-/// kind: "boards" (default), "gold" (moves the Locksmith gold door here), "shutter" (the power shutter).
+/// kind: "boards" (default), "gold" (moves the Locksmith gold door here), "shutter" (the power shutter),
+/// "stairs" (a sealed stairwell's entrance: boards the passage at the spot, never a door), "open" (a door that must never be boarded).
 /// </summary>
 public static class ExtraBoards
 {
@@ -40,6 +41,12 @@ public static class ExtraBoards
     }
 
     public static (Vector3 center, Vector3 facing, float width) Fit(Spot spot) => Fit(spot, out _);
+
+    /// <summary>
+    /// Stair entrances ("stairs" spots): board the passage right at the spot, never a nearby door
+    /// (the doors next to stair passages usually belong to real rooms).
+    /// </summary>
+    public static (Vector3 center, Vector3 facing, float width) FitPassage(Spot spot) => FitGap(new Vector3(spot.x, 0f, spot.z), 0.45f, true);
 
     /// <summary>
     /// Where the blocker goes for a spot: floor centre, the direction its back faces (away from the
@@ -78,15 +85,25 @@ public static class ExtraBoards
         }
 
         // 2) The narrowest gap close to the spot (a doorway or a narrow passage).
+        return FitGap(point, 1.2f, false);
+    }
+
+    /// <summary>
+    /// The gap through <paramref name="point"/> (searching up to <paramref name="radius"/> around it):
+    /// narrowest first, or nearest first when <paramref name="nearestFirst"/>.
+    /// </summary>
+    private static (Vector3 center, Vector3 facing, float width) FitGap(Vector3 point, float radius, bool nearestFirst)
+    {
         Vector3 bestCenter = point;
         Vector3 bestFacing = Vector3.forward;
         float bestWidth = float.MaxValue;
         float bestOffset = float.MaxValue;
-        for (float ox = -1.2f; ox <= 1.21f; ox += 0.2f)
-        for (float oz = -1.2f; oz <= 1.21f; oz += 0.2f)
+        float step = radius > 0.6f ? 0.2f : 0.15f;
+        for (float ox = -radius; ox <= radius + 0.01f; ox += step)
+        for (float oz = -radius; oz <= radius + 0.01f; oz += step)
         {
             float offset = Mathf.Sqrt(ox * ox + oz * oz);
-            if (offset > 1.2f)
+            if (offset > radius)
                 continue;
 
             Vector3 origin = new(point.x + ox, 1f, point.z + oz);
@@ -100,7 +117,12 @@ public static class ExtraBoards
             float width = alongX ? widthX : widthZ;
             if (width < 0.7f)
                 continue;
-            if (width > bestWidth + 0.05f || (Mathf.Abs(width - bestWidth) <= 0.05f && offset >= bestOffset))
+            if (nearestFirst)
+            {
+                if (offset > bestOffset + 0.01f || (Mathf.Abs(offset - bestOffset) <= 0.01f && width >= bestWidth))
+                    continue;
+            }
+            else if (width > bestWidth + 0.05f || (Mathf.Abs(width - bestWidth) <= 0.05f && offset >= bestOffset))
                 continue;
 
             bestWidth = width;

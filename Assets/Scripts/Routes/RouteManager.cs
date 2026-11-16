@@ -101,12 +101,52 @@ public class RouteManager : NetworkBehaviour
     public override void OnNetworkSpawn()
     {
         Instance = this;
+
+        // In-scene objects keep their network values from the last session (after a disconnect and
+        // a new host), so a new session must start from Waiting or the round never resets and the
+        // previous round's open doors/exits carry over.
+        if (IsServer)
+        {
+            ServerBackToWaiting();
+            NetworkManager.OnClientDisconnectCallback += OnClientDisconnected;
+        }
     }
 
     public override void OnNetworkDespawn()
     {
         if (Instance == this)
             Instance = null;
+        if (NetworkManager != null)
+            NetworkManager.OnClientDisconnectCallback -= OnClientDisconnected;
+    }
+
+    private void ServerBackToWaiting()
+    {
+        Phase.Value = RoundPhase.Waiting;
+        ResultText.Value = default;
+        RunnerWon.Value = false;
+    }
+
+    /// <summary>
+    /// Server: someone left mid-match. Send whoever is still here back to the lobby; the next match
+    /// starts a fresh round.
+    /// </summary>
+    private void OnClientDisconnected(ulong clientId)
+    {
+        if (!IsServer || NetworkManager == null || NetworkManager.ShutdownInProgress || clientId == NetworkManager.ServerClientId)
+            return;
+        if (LocalSinglePlayerMode.IsActive || Phase.Value == RoundPhase.Waiting)
+            return;
+
+        ServerBackToWaiting();
+        foreach (NetworkPlayerController player in AllPlayers())
+        {
+            if (player.OwnerClientId == clientId)
+                continue;
+            player.MatchStarted.Value = false;
+            player.IsReady.Value = false;
+            player.MovementLocked.Value = false;
+        }
     }
 
     private void Update()
@@ -617,7 +657,7 @@ public class RouteManager : NetworkBehaviour
                         {
                             if (string.IsNullOrEmpty(item.itemId))
                                 continue;
-                            int have = inventory != null ? inventory.CountOf(item.itemId) : 0;
+                            int have = pending.HaveCount(item.itemId, inventory);
                             row.Needs.Add((item.itemId, Mathf.Min(have, item.SafeCount), item.SafeCount));
                         }
                     }
@@ -712,7 +752,7 @@ public class RouteManager : NetworkBehaviour
                 if (string.IsNullOrEmpty(item.itemId))
                     continue;
 
-                int have = inventory != null ? inventory.CountOf(item.itemId) : 0;
+                int have = next.HaveCount(item.itemId, inventory);
                 if (have < item.SafeCount)
                     missing.Add(item.SafeCount > 1 ? $"{ItemIds.DisplayName(item.itemId)} {have}/{item.SafeCount}" : ItemIds.DisplayName(item.itemId));
             }

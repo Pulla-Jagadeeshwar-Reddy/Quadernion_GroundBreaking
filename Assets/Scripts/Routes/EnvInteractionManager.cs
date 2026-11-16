@@ -58,6 +58,9 @@ public class EnvInteractionManager : NetworkBehaviour
     private Target[] targets = Array.Empty<Target>();
     private List<Transform>[] fanBlades;
     private float[] fanSpeed;
+    private Vector3[] fanHub;
+    private GameObject aimRoot;
+    private const int AimLayer = 2; // built-in "Ignore Raycast": other systems' default raycasts skip it
 
     public IReadOnlyList<EnvSpot> Spots => spots;
 
@@ -84,6 +87,7 @@ public class EnvInteractionManager : NetworkBehaviour
         }
 
         FindFanBlades();
+        BuildAimTargets();
     }
 
     public override void OnNetworkDespawn()
@@ -92,6 +96,94 @@ public class EnvInteractionManager : NetworkBehaviour
             Instance = null;
         if (outline != null)
             Destroy(outline.gameObject);
+        if (aimRoot != null)
+            Destroy(aimRoot);
+        aimTargets.Clear();
+    }
+
+    private readonly Dictionary<Collider, int> aimTargets = new();
+
+    /// <summary>
+    /// Local only: one trigger box per desk and fan on the Ignore Raycast layer, so aiming at them
+    /// is a plain raycast against a real collider. Nothing else hits these (default raycasts skip
+    /// that layer and character controllers ignore triggers).
+    /// </summary>
+    private void BuildAimTargets()
+    {
+        if (aimRoot != null)
+            Destroy(aimRoot);
+        aimTargets.Clear();
+
+        aimRoot = new GameObject("Env Aim Targets") { layer = AimLayer };
+        for (int index = 0; index < spots.Length; index++)
+        {
+            EnvSpot spot = spots[index];
+            if (spot.kind == EnvKind.Window)
+                continue;
+
+            GameObject box = new($"Aim {spot.kind} {index}") { layer = AimLayer };
+            box.transform.SetParent(aimRoot.transform, false);
+            box.transform.position = spot.center;
+            BoxCollider collider = box.AddComponent<BoxCollider>();
+            collider.isTrigger = true;
+            // A little taller than the desk so the top edge is easy to catch from a standing view.
+            collider.size = spot.kind == EnvKind.Desk ? spot.size + new Vector3(0.06f, 0.12f, 0.06f) : spot.size + Vector3.one * 0.1f;
+            aimTargets[collider] = index;
+        }
+    }
+
+    /// <summary>
+    /// Desk/fan under the crosshair via the aim triggers. Solid things in front only block when they
+    /// are wall-like (tall, or a floor/ceiling slab); railings, chairs and the desk's own collision
+    /// box do not.
+    /// </summary>
+    private bool TryFindAimedByCollider(Ray ray, float maxDistance, NetworkPlayerController player, out Target found)
+    {
+        found = null;
+        RaycastHit[] hits = Physics.RaycastAll(ray, maxDistance, 1 << AimLayer, QueryTriggerInteraction.Collide);
+        if (hits.Length == 0)
+            return false;
+
+        Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
+        foreach (RaycastHit hit in hits)
+        {
+            if (!aimTargets.TryGetValue(hit.collider, out int index) || index >= targets.Length)
+                continue;
+            if (string.IsNullOrEmpty(PromptFor(index, player)))
+                continue;
+            if (IsBlocked(ray, hit.distance, spots[index], player))
+                return false;
+
+            found = targets[index];
+            return true;
+        }
+
+        return false;
+    }
+
+    private static bool IsBlocked(Ray ray, float distance, EnvSpot spot, NetworkPlayerController player)
+    {
+        Bounds own = new(spot.center, spot.size + Vector3.one * 0.3f);
+        RaycastHit[] solids = Physics.RaycastAll(ray, distance, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore);
+        foreach (RaycastHit solid in solids)
+        {
+            if (solid.distance >= distance - 0.02f)
+                continue;
+            if (player != null && solid.collider.transform.IsChildOf(player.transform))
+                continue;
+
+            Bounds bounds = solid.collider.bounds;
+            if (bounds.Intersects(own))
+                continue; // the desk's own collision box, or something sitting on it
+
+            Vector3 size = bounds.size;
+            bool tall = size.y >= 1.5f;
+            bool slab = size.y < 0.25f && Mathf.Min(size.x, size.z) > 1.5f;
+            if (tall || slab)
+                return true;
+        }
+
+        return false;
     }
 
     private byte State(int index) => states != null && index >= 0 && index < states.Count ? states[index] : (byte)0;
@@ -110,9 +202,10 @@ public class EnvInteractionManager : NetworkBehaviour
 
         contents.Clear();
         holds.Clear();
-        // Every desk can be searched; only some hide an item.
+        // Desks start closed; the ones that hide an item, plus a few empty decoys
+        // (ServerOpenDecoyDesks), become searchable for this round. Fans/windows reset to 0.
         for (int index = 0; index < states.Count; index++)
-            states[index] = 0;
+            states[index] = index < spots.Length && spots[index].kind == EnvKind.Desk ? (byte)3 : (byte)0;
         HiddenCount.Value = 0;
         HiddenRooms.Value = default;
         NextDistractTime.Value = 0d;
@@ -217,28 +310,31 @@ public class EnvInteractionManager : NetworkBehaviour
         NetworkInventory inventory, out INetworkInteractable target)
     {
         target = null;
-        // Desks may sit behind a railing or chair: allow a little more than other spots.
-        float best = Mathf.Min(maxDistance, firstSolid + 0.15f);
-        float deskBest = Mathf.Min(maxDistance, firstSolid + 0.7f);
-        Vector3? point = !float.IsPositiveInfinity(firstSolid) && firstSolid <= maxDistance ? ray.GetPoint(firstSolid) : null;
 
-        for (int index = 0; index < spots.Length && index < targets.Length; index++)
+        // Desks and fans: real trigger colliders.
+        if (TryFindAimedByCollider(ray, maxDistance, player, out Target colliderTarget))
+            target = colliderTarget;
+
+        // Windows: ray-vs-box against the glass (the point looked at, or just in front of a wall).
+        float best = Mathf.Min(maxDistance, firstSolid + 0.15f);
+        Vector3? point = !float.IsPositiveInfinity(firstSolid) && firstSolid <= maxDistance ? ray.GetPoint(firstSolid) : null;
+        for (int index = 0; target == null && index < spots.Length && index < targets.Length; index++)
         {
             EnvSpot spot = spots[index];
-            Bounds bounds = new(spot.center, spot.size + Vector3.one * 0.04f);
-            float distance;
-
-            float limit = spot.kind == EnvKind.Desk ? deskBest : best;
-            if (spot.kind == EnvKind.Window && point.HasValue && bounds.Contains(point.Value))
-                distance = firstSolid;
-            else if (!bounds.IntersectRay(ray, out distance) || distance > limit)
+            if (spot.kind != EnvKind.Window)
                 continue;
 
-            if (distance > limit || string.IsNullOrEmpty(PromptFor(index, player)))
+            Bounds bounds = new(spot.center, spot.size + Vector3.one * 0.04f);
+            float distance;
+            if (point.HasValue && bounds.Contains(point.Value))
+                distance = firstSolid;
+            else if (!bounds.IntersectRay(ray, out distance) || distance > best)
+                continue;
+
+            if (distance > best || string.IsNullOrEmpty(PromptFor(index, player)))
                 continue;
 
             best = Mathf.Min(best, distance);
-            deskBest = Mathf.Min(deskBest, distance);
             target = targets[index];
         }
 
@@ -250,7 +346,7 @@ public class EnvInteractionManager : NetworkBehaviour
         }
 
         // Grace: keep the last target briefly if the ray is still within 15 cm of its box.
-        if (lastAimed != null && Time.time - lastAimedTime < 0.2f &&
+        if (lastAimed != null && Time.time - lastAimedTime < 0.35f &&
             !string.IsNullOrEmpty(PromptFor(lastAimed.Index, player)))
         {
             EnvSpot spot = spots[lastAimed.Index];
@@ -549,6 +645,7 @@ public class EnvInteractionManager : NetworkBehaviour
     {
         fanBlades = new List<Transform>[spots.Length];
         fanSpeed = new float[spots.Length];
+        fanHub = new Vector3[spots.Length];
         Renderer[] renderers = null;
         for (int index = 0; index < spots.Length; index++)
         {
@@ -556,12 +653,48 @@ public class EnvInteractionManager : NetworkBehaviour
                 continue;
 
             renderers ??= FindObjectsByType<Renderer>(FindObjectsInactive.Exclude);
-            fanBlades[index] = renderers
+            List<Renderer> blades = renderers
                 .Where(r => r.name.StartsWith("Blades", StringComparison.Ordinal) &&
                             Vector3.Distance(r.bounds.center, spots[index].center) < 0.6f)
-                .Select(r => r.transform)
                 .ToList();
+            fanBlades[index] = blades.Select(r => r.transform).ToList();
+            fanHub[index] = FindFanHub(spots[index].center, blades, renderers);
         }
+    }
+
+    /// <summary>
+    /// The point the blades turn around. The blades' bounding-box centre is NOT the hub for a
+    /// three-blade fan (the box is lopsided), so prefer the fan's motor housing ("Top") right above,
+    /// then the centroid of the blade mesh, and only then the box centre.
+    /// </summary>
+    private static Vector3 FindFanHub(Vector3 boxCenter, List<Renderer> blades, Renderer[] renderers)
+    {
+        Renderer housing = renderers
+            .Where(r => r.name.StartsWith("Top", StringComparison.Ordinal) &&
+                        Vector3.Distance(Flat(r.bounds.center), Flat(boxCenter)) < 0.6f &&
+                        Mathf.Abs(r.bounds.center.y - boxCenter.y) < 1.2f &&
+                        Mathf.Max(r.bounds.size.x, r.bounds.size.z) < 0.8f)
+            .OrderBy(r => Vector3.Distance(r.bounds.center, boxCenter))
+            .FirstOrDefault();
+        if (housing != null)
+            return new Vector3(housing.bounds.center.x, boxCenter.y, housing.bounds.center.z);
+
+        foreach (Renderer blade in blades)
+        {
+            MeshFilter filter = blade.GetComponent<MeshFilter>();
+            Mesh mesh = filter != null ? filter.sharedMesh : null;
+            if (mesh == null || !mesh.isReadable || mesh.vertexCount == 0)
+                continue;
+
+            Vector3 sum = Vector3.zero;
+            Vector3[] vertices = mesh.vertices;
+            foreach (Vector3 vertex in vertices)
+                sum += vertex;
+            Vector3 centroid = blade.transform.TransformPoint(sum / vertices.Length);
+            return new Vector3(centroid.x, boxCenter.y, centroid.z);
+        }
+
+        return boxCenter;
     }
 
     private void SpinFans()
@@ -582,7 +715,7 @@ public class EnvInteractionManager : NetworkBehaviour
             foreach (Transform blade in fanBlades[index])
             {
                 if (blade != null)
-                    blade.RotateAround(spots[index].center, Vector3.up, fanSpeed[index] * Time.deltaTime);
+                    blade.RotateAround(fanHub[index], Vector3.up, fanSpeed[index] * Time.deltaTime);
             }
         }
     }

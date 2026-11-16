@@ -18,15 +18,45 @@ public class RelayConnectionUI : MonoBehaviour
     private bool busy;
     private string lastError;
 
+    private static RelayConnectionUI active;
+
     private void Awake()
     {
         if (networkManager == null)
             networkManager = NetworkManager.Singleton;
     }
 
+    private void OnEnable()
+    {
+        // A joining client re-loads the scene while syncing with the host, which brings a second
+        // copy of this panel (on the scene's idle NetworkManager copy). Only one panel may draw:
+        // the one whose NetworkManager is the live singleton.
+        if (active != null && active != this && active.isActiveAndEnabled)
+        {
+            if (active.networkManager == NetworkManager.Singleton || networkManager != NetworkManager.Singleton)
+            {
+                enabled = false;
+                return;
+            }
+
+            active.enabled = false;
+        }
+
+        active = this;
+    }
+
+    private void OnDisable()
+    {
+        if (active == this)
+            active = null;
+    }
+
     private void OnGUI()
     {
-        if (networkManager == null)
+        if (active != this)
+            return;
+
+        if (networkManager == null || (NetworkManager.Singleton != null && networkManager != NetworkManager.Singleton))
             networkManager = NetworkManager.Singleton;
 
         if (networkManager != null && networkManager.IsListening)

@@ -116,7 +116,7 @@ public class RelayConnectionUI : MonoBehaviour
         // (cursor unlocked) to bring up a small one at the top centre with the Disconnect button.
         if (matchStarted)
         {
-            if (Cursor.lockState == CursorLockMode.Locked)
+            if (Cursor.lockState == CursorLockMode.Locked || PauseMenu.IsOpen)
                 return;
 
             Rect panel = new(Screen.width * 0.5f - 160f, 10f, 320f, 64f);
@@ -243,6 +243,15 @@ public class RelayConnectionUI : MonoBehaviour
         {
             busy = false;
         }
+    }
+
+    /// <summary>Leave the match from anywhere (pause menu).</summary>
+    public static void DisconnectActive()
+    {
+        if (active != null)
+            active.Disconnect();
+        else if (NetworkManager.Singleton != null && NetworkManager.Singleton.IsListening)
+            NetworkManager.Singleton.Shutdown();
     }
 
     private void Disconnect()

@@ -227,6 +227,7 @@ public class RouteInteractable : NetworkBehaviour, INetworkInteractable
         Stage.OnValueChanged += OnStageChanged;
         Active.OnValueChanged += OnActiveChanged;
         deposited.OnListChanged += OnDepositsChanged;
+        HolderClientId.OnValueChanged += OnHolderChanged;
         ApplyVisuals();
     }
 
@@ -236,11 +237,52 @@ public class RouteInteractable : NetworkBehaviour, INetworkInteractable
         Stage.OnValueChanged -= OnStageChanged;
         Active.OnValueChanged -= OnActiveChanged;
         deposited.OnListChanged -= OnDepositsChanged;
+        HolderClientId.OnValueChanged -= OnHolderChanged;
+        holdSound?.End();
     }
 
-    private void OnDepositsChanged(NetworkListEvent<int> change) => ApplyVisuals();
+    private void OnDepositsChanged(NetworkListEvent<int> change)
+    {
+        ApplyVisuals();
+        if (RouteManager.RoundLive && change.Type == NetworkListEvent<int>.EventType.Value && change.Value > change.PreviousValue)
+            Sfx.Play("place", transform.position, 0.8f, 14f);
+    }
 
-    private void OnStageChanged(int previous, int current) => ApplyVisuals();
+    private void OnStageChanged(int previous, int current)
+    {
+        ApplyVisuals();
+        if (RouteManager.RoundLive && current > previous)
+            Sfx.Play(Sounds.done, transform.position, 1f, 26f);
+    }
+
+    // ------------------------------------------------------------------ sound
+
+    private SfxRepeater holdSound;
+
+    /// <summary>What this step sounds like while held (group, seconds between plays, volume), and when a stage finishes.</summary>
+    private (string loop, float interval, float volume, string done) Sounds => objectId switch
+    {
+        _ when objectId.StartsWith("R1_KeyCabinet") => ("hit", 0.55f, 0.8f, "shatter"),
+        "R1_TV" => ("beep", 0.7f, 0.6f, "confirm"),
+        "R1_StairDoor" => ("pry", 0.8f, 0.8f, "unlock"),
+        "R2_PanelCover" => ("screw", 0.9f, 0.45f, "metal_drop"),
+        "R2_Panel" => ("electric", 0.9f, 0.7f, "power_on"),
+        "R3_LadderSpot" => ("hammer", 0.45f, 0.8f, "wood_place"),
+        "R5_Freezer" => ("pry", 0.8f, 0.8f, "door_open"),
+        "R5_ChainLock" => ("chain", 0.6f, 0.8f, "unlock"),
+        _ when objectId.StartsWith("R3_PC") => ("hack", 1.6f, 0.22f, "confirm"),
+        _ when objectId.StartsWith("R5_SmashBench") => ("ice_hit", 0.6f, 0.8f, "ice_shatter"),
+        _ => ("rummage", 0.6f, 0.8f, "confirm"),
+    };
+
+    private void OnHolderChanged(ulong previous, ulong current)
+    {
+        holdSound ??= new SfxRepeater(Sounds.loop, Sounds.interval, Sounds.volume, Sounds.loop == "hack");
+        if (current != ulong.MaxValue && RouteManager.RoundLive)
+            holdSound.Begin(holdSeconds * (1f - GetHoldProgress()));
+        else
+            holdSound.End();
+    }
     private void OnActiveChanged(bool previous, bool current) => ApplyVisuals();
 
     private void ApplyVisuals()
@@ -422,7 +464,7 @@ public class RouteInteractable : NetworkBehaviour, INetworkInteractable
 
         // Place whatever pieces the player carries (fuses, planks, the ice block) before checking
         // whether everything is here; if this completes the set, the hold starts right away.
-        if (player.MatchStarted.Value && !player.MovementLocked.Value && !(runnerOnly && player.IsGranny) &&
+        if (player.MatchStarted.Value && !player.ActionsLocked && !(runnerOnly && player.IsGranny) &&
             PrerequisitesDone() && DistanceTo(player.transform.position) <= serverInteractionRange &&
             ServerDeposit(inventory))
         {
@@ -474,6 +516,7 @@ public class RouteInteractable : NetworkBehaviour, INetworkInteractable
 
     private void Update()
     {
+        holdSound?.Tick(transform.position);
         if (!IsServer || !IsSpawned || !IsHeld)
             return;
 
@@ -517,7 +560,7 @@ public class RouteInteractable : NetworkBehaviour, INetworkInteractable
 
     private bool CanServerUse(NetworkPlayerController player, NetworkInventory inventory)
     {
-        if (player == null || !player.MatchStarted.Value || player.MovementLocked.Value)
+        if (player == null || !player.MatchStarted.Value || player.ActionsLocked)
             return false;
 
         if (runnerOnly && player.IsGranny)

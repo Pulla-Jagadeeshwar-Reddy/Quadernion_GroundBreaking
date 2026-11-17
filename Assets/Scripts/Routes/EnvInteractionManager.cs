@@ -497,12 +497,14 @@ public class EnvInteractionManager : NetworkBehaviour
             localDuration = HoldSeconds;
             localStart = Time.time;
             manager.BeginRpc(index);
+            manager.StartLocalRummage(index, localDuration);
         }
 
         public void CancelInteract()
         {
             localStart = -1f;
             manager.CancelRpc();
+            manager.StopLocalRummage();
         }
     }
 
@@ -523,6 +525,7 @@ public class EnvInteractionManager : NetworkBehaviour
         {
             case EnvKind.Fan:
                 states[index] = (byte)(State(index) == 0 ? 1 : 0);
+                RouteManager.Instance?.ServerSfx("switch", spot.center, 0.7f, 14f);
                 break;
 
             case EnvKind.Desk:
@@ -543,10 +546,38 @@ public class EnvInteractionManager : NetworkBehaviour
         holds.Remove(rpcParams.Receive.SenderClientId);
     }
 
+    // The searcher hears their own rummaging (desk) or wind-up (window); results are sent to everyone.
+    private readonly SfxRepeater rummage = new("rummage", 0.55f, 0.6f);
+    private int rummageIndex = -1;
+    private float rummageEnd;
+
+    private void StartLocalRummage(int index, float seconds)
+    {
+        if (index < 0 || index >= spots.Length || spots[index].kind != EnvKind.Desk || seconds <= 0f)
+            return;
+        rummageIndex = index;
+        rummageEnd = Time.time + seconds;
+        rummage.Begin();
+    }
+
+    private void StopLocalRummage()
+    {
+        rummageIndex = -1;
+        rummage.End();
+    }
+
     private void Update()
     {
         if (IsSpawned)
             SpinFans();
+
+        if (rummageIndex >= 0)
+        {
+            if (Time.time > rummageEnd)
+                StopLocalRummage();
+            else
+                rummage.Tick(spots[rummageIndex].center);
+        }
 
         if (!IsServer || holds.Count == 0)
             return;
@@ -555,7 +586,7 @@ public class EnvInteractionManager : NetworkBehaviour
         {
             (int index, double start, float duration) = holds[client];
             if (!TryGetPlayer(client, out NetworkPlayerController player, out NetworkInventory inventory) ||
-                player.MovementLocked.Value || !InRange(player, index))
+                player.ActionsLocked || !InRange(player, index))
             {
                 holds.Remove(client);
                 continue;
@@ -581,12 +612,14 @@ public class EnvInteractionManager : NetworkBehaviour
                 HiddenCount.Value = Mathf.Max(0, HiddenCount.Value - 1);
                 ServerUpdateHiddenRooms();
                 states[index] = 2;
+                RouteManager.Instance?.ServerSfx("drawer_found", spot.center, 0.8f, 14f);
                 ToastRpc($"Found {ItemIds.DisplayName(found.itemId)} in the {spot.label.ToLowerInvariant()}!",
                     RpcTarget.Single(player.OwnerClientId, RpcTargetUse.Temp));
             }
             else
             {
                 states[index] = 1;
+                RouteManager.Instance?.ServerSfx("drawer_empty", spot.center, 0.6f, 12f);
                 ToastRpc("Nothing here.", RpcTarget.Single(player.OwnerClientId, RpcTargetUse.Temp));
             }
         }
@@ -595,6 +628,8 @@ public class EnvInteractionManager : NetworkBehaviour
             NextDistractTime.Value = Now + distractCooldown;
             Vector3 decoy = PickDecoy(spot.center);
             RouteManager.Instance?.ServerMakeNoise(decoy, NoiseLevel.Loud, "Something crashed");
+            RouteManager.Instance?.ServerSfx("throw", spot.center, 0.7f, 10f);
+            RouteManager.Instance?.ServerSfx("crash", decoy + Vector3.up, 1f, 40f);
             ToastRpc($"Thrown! Granny heard a crash near {RoomVolume.NameAt(decoy)}.",
                 RpcTarget.Single(player.OwnerClientId, RpcTargetUse.Temp));
         }

@@ -105,7 +105,7 @@ public class NetworkLockedDoor : NetworkBehaviour, INetworkInteractable, ISecond
         if (holdClient == ulong.MaxValue)
             return;
 
-        if (!TryGetInRangePlayer(holdClient, out NetworkPlayerController role) || role.MovementLocked.Value)
+        if (!TryGetInRangePlayer(holdClient, out NetworkPlayerController role) || role.ActionsLocked)
         {
             holdClient = ulong.MaxValue;
             return;
@@ -143,6 +143,7 @@ public class NetworkLockedDoor : NetworkBehaviour, INetworkInteractable, ISecond
     [Rpc(SendTo.Everyone)]
     private void DoorBrokenRpc(Unity.Collections.FixedString64Bytes room)
     {
+        Sfx.Play("door_break", LeafCenter, 1f, 35f);
         NetworkPlayerController local = LocalPlayer;
         if (local != null && !local.IsGranny)
             RunnerHud.AddToast($"Granny smashed through a jammed door ({room})!", new Color(1f, 0.4f, 0.35f), true);
@@ -168,6 +169,8 @@ public class NetworkLockedDoor : NetworkBehaviour, INetworkInteractable, ISecond
 
     private void OnJammedChanged(bool previousValue, bool newValue)
     {
+        if (RouteManager.RoundLive && newValue && !previousValue)
+            Sfx.Play("wood_place", LeafCenter, 0.7f, 14f);
         if (newValue)
         {
             if (jamVisual == null && TryGetLeafBounds(out Bounds leaf))
@@ -754,6 +757,8 @@ public class NetworkLockedDoor : NetworkBehaviour, INetworkInteractable, ISecond
     {
         if (newValue)
             SetBlockersEnabled(false);
+        if (RouteManager.RoundLive && previousValue != newValue)
+            Sfx.Play(newValue ? "door_open" : "door_close", LeafCenter, 0.8f, 16f);
     }
 
     private void SetBlockersEnabled(bool enabled)

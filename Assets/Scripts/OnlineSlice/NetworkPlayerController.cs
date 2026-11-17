@@ -45,7 +45,18 @@ public class NetworkPlayerController : NetworkBehaviour
         NetworkVariableReadPermission.Everyone,
         NetworkVariableWritePermission.Server);
 
+    /// <summary>Runner's flashlight (Q). Owner-written so Granny sees the beam too.</summary>
+    public NetworkVariable<bool> FlashlightOn = new(
+        false,
+        NetworkVariableReadPermission.Everyone,
+        NetworkVariableWritePermission.Owner);
+
+    private Light flashlight;
+
     public bool IsSprinting { get; private set; }
+
+    /// <summary>No moving or interacting: the round is over, or this is Granny before her release.</summary>
+    public bool ActionsLocked => MovementLocked.Value || IsGranny && RouteManager.GrannyHeld;
     /// <summary>Why Shift is held but sprint is off (null when not relevant). Shown by the HUD.</summary>
     public string SprintBlockedReason { get; private set; }
 
@@ -73,12 +84,42 @@ public class NetworkPlayerController : NetworkBehaviour
             playerCamera = GetComponentInChildren<UnityEngine.Camera>(true);
         if (playerCamera != null)
             cameraBaseLocalY = playerCamera.transform.localPosition.y;
+        if (GetComponent<Footsteps>() == null)
+            gameObject.AddComponent<Footsteps>();
+        CreateFlashlight();
+    }
+
+    private void CreateFlashlight()
+    {
+        Transform mount = playerCamera != null ? playerCamera.transform : transform;
+        GameObject lightObject = new("Flashlight");
+        lightObject.transform.SetParent(mount, false);
+        lightObject.transform.localPosition = new Vector3(0.18f, -0.15f, 0.1f);
+        flashlight = lightObject.AddComponent<Light>();
+        flashlight.type = LightType.Spot;
+        flashlight.spotAngle = 52f;
+        flashlight.innerSpotAngle = 22f;
+        flashlight.range = 16f;
+        flashlight.intensity = 3.2f;
+        flashlight.color = new Color(1f, 0.95f, 0.85f);
+        flashlight.shadows = LightShadows.Soft;
+        flashlight.enabled = false;
+    }
+
+    private void OnFlashlightChanged(bool previous, bool current)
+    {
+        if (flashlight != null)
+            flashlight.enabled = current;
+        Sfx.Play("click", transform.position + Vector3.up * 1.4f, 0.5f, 8f);
     }
 
     public override void OnNetworkSpawn()
     {
         MatchStarted.OnValueChanged += OnMatchStartedChanged;
         MovementLocked.OnValueChanged += OnMovementLockedChanged;
+        FlashlightOn.OnValueChanged += OnFlashlightChanged;
+        if (flashlight != null)
+            flashlight.enabled = FlashlightOn.Value;
         bool isLocalPlayer = IsOwner;
 
         if (IsServer && LocalSinglePlayerMode.IsActive)
@@ -117,6 +158,7 @@ public class NetworkPlayerController : NetworkBehaviour
     {
         MatchStarted.OnValueChanged -= OnMatchStartedChanged;
         MovementLocked.OnValueChanged -= OnMovementLockedChanged;
+        FlashlightOn.OnValueChanged -= OnFlashlightChanged;
         if (IsOwner)
             UnlockCursor();
     }
@@ -129,7 +171,7 @@ public class NetworkPlayerController : NetworkBehaviour
         // Free the mouse for the result screen; take it back when the next round starts.
         if (newValue)
             UnlockCursor();
-        else if (MatchStarted.Value)
+        else if (MatchStarted.Value && !PauseMenu.IsOpen)
             LockCursor();
     }
 
@@ -200,17 +242,39 @@ public class NetworkPlayerController : NetworkBehaviour
             return;
 
         if (keyboard.escapeKey.wasPressedThisFrame)
-            UnlockCursor();
+        {
+            PauseMenu.Toggle();
+            if (PauseMenu.IsOpen)
+                UnlockCursor();
+            else if (!MovementLocked.Value)
+                LockCursor();
+        }
+
+        // The game keeps running for the other player; this one just stops taking input.
+        if (PauseMenu.IsOpen)
+        {
+            if (cursorLocked)
+                UnlockCursor();
+            IsSprinting = false;
+            verticalSpeed += gravity * Time.deltaTime;
+            characterController.Move(Vector3.up * (verticalSpeed * Time.deltaTime));
+            return;
+        }
+
         if (mouse != null && mouse.leftButton.wasPressedThisFrame && !MovementLocked.Value)
             LockCursor();
 
-        bool wantsToCrouch = keyboard.cKey.isPressed;
+        if (!IsGranny && keyboard.qKey.wasPressedThisFrame && !MovementLocked.Value)
+            FlashlightOn.Value = !FlashlightOn.Value;
+
+        // Granny never crouches: crouch gaps are the Runner's escape.
+        bool wantsToCrouch = !IsGranny && keyboard.cKey.isPressed;
         if (wantsToCrouch != isCrouched && (wantsToCrouch || CanStandUp()))
             SetCrouched(wantsToCrouch);
 
         if (cursorLocked && mouse != null && playerCamera != null)
         {
-            Vector2 delta = mouse.delta.ReadValue() * mouseSensitivity;
+            Vector2 delta = mouse.delta.ReadValue() * (mouseSensitivity * GameSettings.MouseSensitivity);
             transform.Rotate(0f, delta.x, 0f);
             pitch = Mathf.Clamp(pitch - delta.y, -80f, 80f);
             playerCamera.transform.localRotation = Quaternion.Euler(pitch, 0f, 0f);
@@ -233,7 +297,7 @@ public class NetworkPlayerController : NetworkBehaviour
             sideways = Axis(keyboard.rightArrowKey.isPressed, keyboard.leftArrowKey.isPressed);
         }
 
-        if (MovementLocked.Value)
+        if (ActionsLocked)
         {
             forward = 0f;
             sideways = 0f;
@@ -246,8 +310,9 @@ public class NetworkPlayerController : NetworkBehaviour
         // Either Shift sprints (any forward or diagonal-forward movement).
         bool sprintKey = keyboard.leftShiftKey.isPressed || keyboard.rightShiftKey.isPressed;
         bool heavy = IsCarryingHeavyItem();
-        IsSprinting = sprintKey && !isCrouched && forward > 0f && !heavy;
-        SprintBlockedReason = !sprintKey || IsSprinting || direction.sqrMagnitude < 0.01f ? null
+        // Granny cannot sprint: she has to corner the Runner, not outrun them.
+        IsSprinting = sprintKey && !isCrouched && forward > 0f && !heavy && !IsGranny;
+        SprintBlockedReason = !sprintKey || IsSprinting || IsGranny || direction.sqrMagnitude < 0.01f ? null
             : heavy ? "Too heavy to sprint (ice block)"
             : isCrouched ? "Stand up to sprint"
             : forward <= 0f ? "Sprint only works moving forward"

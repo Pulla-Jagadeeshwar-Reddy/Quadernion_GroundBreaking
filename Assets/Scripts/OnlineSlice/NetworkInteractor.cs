@@ -32,7 +32,7 @@ public class NetworkInteractor : NetworkBehaviour
         if (!IsSpawned || !IsOwner || viewCamera == null || !viewCamera.enabled)
             return;
 
-        if (player == null || !player.MatchStarted.Value || player.MovementLocked.Value)
+        if (player == null || !player.MatchStarted.Value || player.ActionsLocked)
         {
             StopHolding();
             StopSecondary();
@@ -218,7 +218,7 @@ public class NetworkInteractor : NetworkBehaviour
     [Rpc(SendTo.Server, InvokePermission = RpcInvokePermission.Owner)]
     private void CatchRpc(ulong runnerObjectId, RpcParams rpcParams = default)
     {
-        if (player == null || !player.IsGranny || !player.MatchStarted.Value || player.MovementLocked.Value)
+        if (player == null || !player.IsGranny || !player.MatchStarted.Value || player.ActionsLocked)
             return;
 
         if (!NetworkManager.SpawnManager.SpawnedObjects.TryGetValue(runnerObjectId, out NetworkObject target) ||
@@ -242,7 +242,7 @@ public class NetworkInteractor : NetworkBehaviour
         if (player.MatchStarted.Value)
             DrawMatchHud();
 
-        if (player.MovementLocked.Value)
+        if (player.ActionsLocked)
             return;
 
         // Crosshair: always visible (white), yellow when aiming at something usable.
@@ -302,13 +302,24 @@ public class NetworkInteractor : NetworkBehaviour
         const float width = 380f;
         float x = Screen.width - width - 16f;
 
+        // Head start: Granny waits at her spawn while the Runner gets away.
+        if (RouteManager.GrannyHeld)
+        {
+            int seconds = (int)System.Math.Ceiling(RouteManager.GrannyReleaseLeft);
+            string text = player.IsGranny ? $"Released in {seconds} s" : $"Granny is released in {seconds} s";
+            GUIStyle style = new(GUI.skin.box) { fontSize = 26, alignment = TextAnchor.MiddleCenter };
+            style.normal.textColor = player.IsGranny ? new Color(1f, 0.55f, 0.5f) : new Color(1f, 0.9f, 0.5f);
+            GUI.Box(new Rect(Screen.width * 0.5f - 220f, 70f, 440f, 52f), text, style);
+        }
+
         if (player.IsGranny)
         {
-            GUI.Box(new Rect(x, 12f, width, 136f), "GRANNY");
+            GUI.Box(new Rect(x, 12f, width, 158f), "GRANNY");
             GUI.Label(new Rect(x + 14f, 38f, width - 28f, 22f), "Catch the Runner before they escape. Listen for noises.");
-            GUI.Label(new Rect(x + 14f, 62f, width - 28f, 22f), "Move: WASD   Sprint: Shift   Catch: E / Click");
+            GUI.Label(new Rect(x + 14f, 62f, width - 28f, 22f), "Move: WASD   Catch: E / Click   Esc: menu");
             GUI.Label(new Rect(x + 14f, 84f, width - 28f, 22f), "Jammed door? Hold E to break it down.");
             GUI.Label(new Rect(x + 14f, 106f, width - 28f, 22f), "Running fans hide quiet noises: switch them off.");
+            GUI.Label(new Rect(x + 14f, 128f, width - 28f, 22f), "You can't sprint or crouch: cut the Runner off.");
             return;
         }
 

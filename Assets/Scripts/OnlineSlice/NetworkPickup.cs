@@ -114,6 +114,7 @@ public class NetworkPickup : NetworkBehaviour, INetworkInteractable
         }
 
         RouteManager.Instance?.ServerOnItemPickedUp(this, role);
+        RouteManager.Instance?.ServerSfx("pickup", transform.position, 0.8f, 12f);
         NetworkObject.Despawn();
     }
 }

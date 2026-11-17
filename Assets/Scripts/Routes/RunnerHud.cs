@@ -385,9 +385,9 @@ public static class RunnerHud
     {
         const string sprint = "Shift";
         string other = ControlSettings.RunnerUsesWasd ? "arrows" : "WASD";
-        GUI.Label(new Rect(16f, Screen.height - 46f, 520f, 40f),
+        GUI.Label(new Rect(16f, Screen.height - 46f, 720f, 40f),
             $"{ControlSettings.RunnerMoveLabel} move   {sprint} sprint   C crouch   Hold E use\n" +
-            $"F jam door   H {(compact ? "expand" : "compact")} routes   F2 use {other}" +
+            $"F jam door   Q flashlight   Esc menu   H {(compact ? "expand" : "compact")} routes   F2 use {other}" +
             (HintUnlocked ? "   Tab: hint" : ""), hintStyle);
     }
 

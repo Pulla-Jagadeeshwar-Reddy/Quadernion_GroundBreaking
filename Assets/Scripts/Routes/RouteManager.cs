@@ -45,6 +45,9 @@ public class RouteManager : NetworkBehaviour
 {
     public static RouteManager Instance { get; private set; }
 
+    /// <summary>True while a round is being played (state-change sounds stay quiet during resets).</summary>
+    public static bool RoundLive => Instance != null && Instance.IsSpawned && Instance.Phase.Value == RoundPhase.Playing;
+
     [Header("Items")]
     [SerializeField] private ItemSpawnRule[] itemRules = Array.Empty<ItemSpawnRule>();
     [SerializeField] private PickupPrefabEntry[] pickupPrefabs = Array.Empty<PickupPrefabEntry>();
@@ -54,12 +57,19 @@ public class RouteManager : NetworkBehaviour
     [SerializeField, Min(1)] private int activePcCount = 3;
     [Tooltip("Alternative spots for the ice-smashing bench; one is used each round.")]
     [SerializeField] private RouteInteractable[] benchCandidates = Array.Empty<RouteInteractable>();
+    [Tooltip("Alternative wall spots for the key cabinet; one is used each round.")]
+    [SerializeField] private RouteInteractable[] cabinetCandidates = Array.Empty<RouteInteractable>();
     [SerializeField] private string pcBonusItem = ItemIds.R3JanitorKey;
 
     [Header("Pressure")]
     [SerializeField] private float smallNoiseRadius = 18f;
     [SerializeField] private float bellKeyPingInterval = 8f;
     [SerializeField] private float catchRange = 1.8f;
+    [Tooltip("Round length; when it runs out Granny wins. 0 = no limit.")]
+    [SerializeField, Min(0f)] private float roundMinutes = 10f;
+    [Tooltip("Seconds Granny is held at her spawn when a round starts, so the Runner gets a head start. " +
+             "The round timer starts when she is released. 0 = no delay.")]
+    [SerializeField, Min(0f)] private float grannyReleaseSeconds = 15f;
 
     [Header("Placement")]
     [SerializeField, Min(1)] private int maxPlacementAttempts = 25;
@@ -68,6 +78,32 @@ public class RouteManager : NetworkBehaviour
     public NetworkVariable<FixedString128Bytes> ResultText = new(default, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
     public NetworkVariable<bool> RunnerWon = new(false, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
     public NetworkVariable<int> RoundSeed = new(0, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+    /// <summary>Server time the round runs out (0 = no limit).</summary>
+    public NetworkVariable<double> RoundEndTime = new(0, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+    /// <summary>Server time Granny is released at round start (0 = not held).</summary>
+    public NetworkVariable<double> GrannyReleaseTime = new(0, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+    /// <summary>Players who pressed Play again on the result screen.</summary>
+    public NetworkVariable<int> RematchVotes = new(0, NetworkVariableReadPermission.Everyone, NetworkVariableWritePermission.Server);
+
+    private readonly HashSet<ulong> rematchVoters = new();
+    private bool votedLocally;
+    private int lastTickSecond = -1;
+    private int lastReleaseSecond = -1;
+    private bool wasHeld;
+
+    /// <summary>True while Granny is still held at her spawn at the start of a round.</summary>
+    public static bool GrannyHeld => GrannyReleaseLeft > 0;
+
+    /// <summary>Seconds until Granny is released on this peer (0 once she is out).</summary>
+    public static double GrannyReleaseLeft
+    {
+        get
+        {
+            if (!RoundLive || Instance.GrannyReleaseTime.Value <= 0 || Instance.NetworkManager == null)
+                return 0;
+            return Math.Max(0, Instance.GrannyReleaseTime.Value - Instance.NetworkManager.ServerTime.Time);
+        }
+    }
 
     private readonly List<NetworkObject> spawnedPickups = new();
     private readonly List<NoisePing> grannyPings = new();
@@ -88,9 +124,10 @@ public class RouteManager : NetworkBehaviour
 
     /// <summary>Builder setup.</summary>
     public void Configure(ItemSpawnRule[] rules, PickupPrefabEntry[] prefabs, RouteInteractable[] pcs, int pcCount, string bonusItem,
-        RouteInteractable[] benches = null)
+        RouteInteractable[] benches = null, RouteInteractable[] cabinets = null)
     {
         benchCandidates = benches ?? Array.Empty<RouteInteractable>();
+        cabinetCandidates = cabinets ?? Array.Empty<RouteInteractable>();
         itemRules = rules;
         pickupPrefabs = prefabs;
         pcCandidates = pcs;
@@ -110,10 +147,67 @@ public class RouteManager : NetworkBehaviour
             ServerBackToWaiting();
             NetworkManager.OnClientDisconnectCallback += OnClientDisconnected;
         }
+
+        Phase.OnValueChanged += OnPhaseChanged;
+        Sfx.StartAmbience();
+    }
+
+    /// <summary>Seconds left in the round on this peer (negative when there is no limit).</summary>
+    /// The clock stands at the full round length until Granny is released.
+    public double SecondsLeft =>
+        RoundEndTime.Value <= 0 || NetworkManager == null ? -1
+        : Math.Min(RoundEndTime.Value - NetworkManager.ServerTime.Time,
+            GrannyReleaseTime.Value > 0 ? RoundEndTime.Value - GrannyReleaseTime.Value : double.MaxValue);
+
+    private void OnPhaseChanged(RoundPhase previous, RoundPhase current)
+    {
+        votedLocally = false;
+        if (current == RoundPhase.Playing)
+        {
+            Sfx.Play2D("round_start", 0.7f);
+            return;
+        }
+
+        if (current != RoundPhase.Ended)
+            return;
+
+        Unity.Netcode.NetworkManager manager = Unity.Netcode.NetworkManager.Singleton;
+        NetworkPlayerController local = manager != null && manager.LocalClient?.PlayerObject != null
+            ? manager.LocalClient.PlayerObject.GetComponent<NetworkPlayerController>()
+            : null;
+        bool localWon = local != null && (local.IsGranny ? !RunnerWon.Value : RunnerWon.Value);
+        Sfx.Play2D(localWon ? "sting_win" : "sting_lose", 0.9f);
+    }
+
+    /// <summary>Server: play a sound for everyone at a position.</summary>
+    public void ServerSfx(string group, Vector3 position, float volume = 1f, float range = 22f)
+    {
+        if (IsServer && IsSpawned)
+            PlaySfxRpc(group, position, volume, range);
+    }
+
+    [Rpc(SendTo.Everyone)]
+    private void PlaySfxRpc(FixedString32Bytes group, Vector3 position, float volume, float range) =>
+        Sfx.Play(group.ToString(), position, volume, range);
+
+    [Rpc(SendTo.Server, InvokePermission = RpcInvokePermission.Everyone)]
+    private void RequestRematchRpc(RpcParams rpcParams = default)
+    {
+        if (Phase.Value != RoundPhase.Ended)
+            return;
+
+        rematchVoters.Add(rpcParams.Receive.SenderClientId);
+        int players = 0;
+        foreach (NetworkPlayerController _ in AllPlayers())
+            players++;
+        RematchVotes.Value = rematchVoters.Count;
+        if (rematchVoters.Count >= players)
+            ServerStartRound();
     }
 
     public override void OnNetworkDespawn()
     {
+        Phase.OnValueChanged -= OnPhaseChanged;
         if (Instance == this)
             Instance = null;
         if (NetworkManager != null)
@@ -123,6 +217,10 @@ public class RouteManager : NetworkBehaviour
     private void ServerBackToWaiting()
     {
         Phase.Value = RoundPhase.Waiting;
+        RoundEndTime.Value = 0;
+        GrannyReleaseTime.Value = 0;
+        rematchVoters.Clear();
+        RematchVotes.Value = 0;
         ResultText.Value = default;
         RunnerWon.Value = false;
     }
@@ -157,6 +255,34 @@ public class RouteManager : NetworkBehaviour
         if (IsServer)
             ServerTick();
 
+        // Granny's release: a tick for each of the last five seconds, a sting when she is out.
+        bool held = GrannyHeld;
+        if (held)
+        {
+            int second = (int)Math.Ceiling(GrannyReleaseLeft);
+            if (second != lastReleaseSecond && second <= 5)
+                Sfx.Play2D("tick", 0.5f);
+            lastReleaseSecond = second;
+        }
+        else if (wasHeld && RoundLive)
+        {
+            Sfx.Play2D("round_start", 0.8f);
+        }
+
+        wasHeld = held;
+
+        // Last minute: a soft tick every second.
+        double left = SecondsLeft;
+        if (Phase.Value == RoundPhase.Playing && left >= 0 && left <= 60)
+        {
+            int second = (int)Math.Ceiling(left);
+            if (second != lastTickSecond)
+            {
+                lastTickSecond = second;
+                Sfx.Play2D("tick", second <= 10 ? 0.6f : 0.3f);
+            }
+        }
+
         // Host shortcut for a quick rematch.
         if (IsServer && Phase.Value == RoundPhase.Ended && Keyboard.current != null && Keyboard.current.rKey.wasPressedThisFrame)
             ServerStartRound();
@@ -174,6 +300,12 @@ public class RouteManager : NetworkBehaviour
 
         if (Phase.Value != RoundPhase.Playing)
             return;
+
+        if (RoundEndTime.Value > 0 && NetworkManager.ServerTime.Time >= RoundEndTime.Value)
+        {
+            EndRound(false, "Time's up! Granny wins.");
+            return;
+        }
 
         NetworkPlayerController runner = FindRunner(out NetworkInventory runnerInventory);
         if (runner != null && runnerInventory != null && runnerInventory.Has(ItemIds.R5BellKey) && Time.time >= nextBellPingTime)
@@ -278,6 +410,12 @@ public class RouteManager : NetworkBehaviour
 
         ResultText.Value = default;
         RunnerWon.Value = false;
+        rematchVoters.Clear();
+        RematchVotes.Value = 0;
+        double now = NetworkManager.ServerTime.Time;
+        GrannyReleaseTime.Value = grannyReleaseSeconds > 0f ? now + grannyReleaseSeconds : 0;
+        double clockStart = GrannyReleaseTime.Value > 0 ? GrannyReleaseTime.Value : now;
+        RoundEndTime.Value = roundMinutes > 0f ? clockStart + roundMinutes * 60.0 : 0;
         Phase.Value = RoundPhase.Playing;
         nextBellPingTime = Time.time + bellKeyPingInterval;
     }
@@ -314,6 +452,7 @@ public class RouteManager : NetworkBehaviour
         public readonly List<RouteInteractable> ActivePcs = new();
         public RouteInteractable BonusPc;
         public RouteInteractable ActiveBench;
+        public RouteInteractable ActiveCabinet;
         public string BonusItem;
         public readonly List<(string itemId, Vector3 position, string room)> Items = new();
         public readonly List<RouteInteractable> Interactables = new();
@@ -350,6 +489,11 @@ public class RouteManager : NetworkBehaviour
         List<RouteInteractable> benches = benchCandidates.Where(b => b != null).ToList();
         if (benches.Count > 0)
             plan.ActiveBench = benches[random.Next(benches.Count)];
+
+        // One key cabinet wall spot per round.
+        List<RouteInteractable> cabinets = cabinetCandidates.Where(c => c != null).ToList();
+        if (cabinets.Count > 0)
+            plan.ActiveCabinet = cabinets[random.Next(cabinets.Count)];
 
         foreach (RouteInteractable step in GetComponentsInParentRoot<RouteInteractable>())
         {
@@ -452,6 +596,8 @@ public class RouteManager : NetworkBehaviour
             return plan.ActivePcs.Contains(step);
         if (benchCandidates.Contains(step))
             return step == plan.ActiveBench;
+        if (cabinetCandidates.Contains(step))
+            return step == plan.ActiveCabinet;
         return true;
     }
 
@@ -794,6 +940,7 @@ public class RouteManager : NetworkBehaviour
             GUI.color = Color.white;
         }
 
+        DrawTimer();
         if (Phase.Value != RoundPhase.Ended)
             return;
 
@@ -802,15 +949,31 @@ public class RouteManager : NetworkBehaviour
         GUIStyle style = new(GUI.skin.label) { alignment = TextAnchor.MiddleCenter, fontSize = 18, fontStyle = FontStyle.Bold };
         GUI.Label(new Rect(box.x + 10f, box.y + 12f, box.width - 20f, 50f), ResultText.Value.ToString(), style);
 
-        if (IsServer)
+        int players = 0;
+        foreach (NetworkPlayerController _ in AllPlayers())
+            players++;
+        GUI.enabled = !votedLocally;
+        if (GUI.Button(new Rect(box.center.x - 90f, box.y + 66f, 180f, 30f), votedLocally ? "Waiting for the other player" : "Play again"))
         {
-            if (GUI.Button(new Rect(box.center.x - 90f, box.y + 70f, 180f, 34f), "Rematch  (R)"))
-                ServerStartRound();
+            votedLocally = true;
+            RequestRematchRpc();
         }
-        else
-        {
-            GUI.Label(new Rect(box.x + 10f, box.y + 74f, box.width - 20f, 30f), "Waiting for the host to start a rematch…",
-                new GUIStyle(GUI.skin.label) { alignment = TextAnchor.MiddleCenter });
-        }
+
+        GUI.enabled = true;
+        GUIStyle small = new(GUI.skin.label) { alignment = TextAnchor.MiddleCenter, fontSize = 11 };
+        string footer = $"{RematchVotes.Value}/{Mathf.Max(players, 1)} ready" + (IsServer ? "   (host: R starts now)" : "");
+        GUI.Label(new Rect(box.x + 10f, box.y + 98f, box.width - 20f, 20f), footer, small);
+    }
+
+    private void DrawTimer()
+    {
+        double left = SecondsLeft;
+        if (Phase.Value != RoundPhase.Playing || left < 0)
+            return;
+
+        int seconds = Mathf.Max(0, (int)Math.Ceiling(left));
+        GUIStyle style = new(GUI.skin.label) { alignment = TextAnchor.MiddleCenter, fontSize = 22, fontStyle = FontStyle.Bold };
+        style.normal.textColor = seconds <= 60 ? new Color(1f, 0.35f, 0.3f) : new Color(1f, 1f, 1f, 0.85f);
+        GUI.Label(new Rect(Screen.width * 0.5f - 80f, 8f, 160f, 32f), $"{seconds / 60}:{seconds % 60:00}", style);
     }
 }

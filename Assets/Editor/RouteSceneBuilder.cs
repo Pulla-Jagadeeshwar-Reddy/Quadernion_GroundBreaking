@@ -6,6 +6,7 @@ using Unity.Netcode;
 using UnityEditor;
 using UnityEditor.SceneManagement;
 using UnityEngine;
+using UnityEngine.Rendering;
 using UnityEngine.SceneManagement;
 using Object = UnityEngine.Object;
 
@@ -67,6 +68,7 @@ public static class RouteSceneBuilder
         new("Laboratory", -12.5f, 0.7f, -13.8f, 3.6f),
         new("Electrical", -18.4f, -17.1f, -15.7f, -12.5f),
         new(JanitorRoom, -13.4f, -10.3f, 5.9f, 8.7f, ItemIds.R3JanitorKey),
+        new("Washroom", -32.1f, -24.3f, -15.9f, -9.8f),
     };
 
     private struct StairSpec
@@ -134,6 +136,7 @@ public static class RouteSceneBuilder
             return;
 
         // Tighten oversized collision boxes, then re-drop every prop, spot and barrier onto the current floor.
+        RestoreCrouchHoles();
         string report = CollisionProxyRefiner.Refine() + "\n\n" + Build() + "\n\n" + Validate(100);
         Debug.Log("[RouteSceneBuilder] " + report);
         EditorUtility.DisplayDialog("Routes refreshed",
@@ -150,10 +153,22 @@ public static class RouteSceneBuilder
     public static void BuildFromCommandLine()
     {
         PlayerModelBuilder.Build();
+        RestoreCrouchHoles();
         Debug.Log("[RouteSceneBuilder] " + CollisionProxyRefiner.Refine());
         string report = Build();
         Debug.Log("[RouteSceneBuilder] " + report);
         Debug.Log("[RouteSceneBuilder] " + Validate(100));
+    }
+
+    /// <summary>
+    /// Walls cut for crouch holes go back to the floor model's own before the collision refiner
+    /// looks at them (it skips switched-off boxes), so every build starts from the same floor.
+    /// </summary>
+    private static void RestoreCrouchHoles()
+    {
+        Scene scene = EditorSceneManager.OpenScene(ScenePath, OpenSceneMode.Single);
+        if (CrouchHoles.Restore() > 0)
+            EditorSceneManager.SaveScene(scene);
     }
 
     // ------------------------------------------------------------------ build
@@ -162,6 +177,10 @@ public static class RouteSceneBuilder
     {
         Scene scene = EditorSceneManager.OpenScene(ScenePath, OpenSceneMode.Single);
         grid = null;
+        // Walls cut for crouch holes by the last build go back to the floor model's own first.
+        int restoredHoles = CrouchHoles.Restore();
+        // Floor model polish first: millimetre offsets against z-fighting, the roof, night lighting.
+        List<string> polish = new() { FloorPolish.FixZFighting(), FloorPolish.PlaceRoof(), FloorPolish.ApplyNight(), FloorPolish.PlaceFogBelow() };
         EnsureFolder(PickupFolder);
         EnsureFolder(MaterialFolder);
 
@@ -173,7 +192,7 @@ public static class RouteSceneBuilder
             Object.DestroyImmediate(old);
 
         GameObject root = new(ContentRootName);
-        List<string> warnings = new();
+        List<string> warnings = new(polish) { $"Crouch holes from the last build undone on {restoredHoles} floor objects." };
 
         // Rooms first: other steps use them for names and locks.
         Transform roomsParent = Child(root.transform, "Rooms");
@@ -183,6 +202,16 @@ public static class RouteSceneBuilder
             roomObject.transform.position = room.Center;
             roomObject.AddComponent<RoomVolume>().Configure(room.Name, room.Size, room.LockedBy);
         }
+
+        // Closing the floor: the washroom at the shutter exit, the lift hall glass, crouch gaps.
+        Transform closing = Child(root.transform, "Floor Closures");
+        warnings.Add(BuildWashroom(closing, materials));
+        warnings.Add(BuildLiftHallGlass(closing, materials));
+        Physics.SyncTransforms();
+        Transform holesParent = Child(root.transform, "Crouch Holes");
+        foreach ((string name, Vector3 near, Vector3 into) in CrouchHoleSpots)
+            warnings.Add(CrouchHoles.Cut(name, near, into, holesParent, materials.DarkMetal, ContentRootName));
+        Physics.SyncTransforms();
 
         // Permanent barriers on stairs that are not an exit.
         if (!DetectStairwells(warnings))
@@ -233,7 +262,8 @@ public static class RouteSceneBuilder
         benchCandidates.Clear();
 
         Transform routes = Child(root.transform, "Routes");
-        BuildLocksmith(Child(routes, "R1 Locksmith"), materials, warnings);
+        BuildLocksmith(Child(routes, "R1 Locksmith"), materials, warnings,
+            envObjects.Where(env => env.Kind == EnvKind.Window).Select(env => env.Bounds).ToList());
         BuildBlackout(Child(routes, "R2 Blackout"), materials, warnings);
         RouteInteractable[] pcs = BuildLadder(Child(routes, "R3 Ladder"), materials, warnings, envObjects);
         BuildFrozenKey(Child(routes, "R5 Frozen Key"), materials, warnings);
@@ -243,6 +273,17 @@ public static class RouteSceneBuilder
         // Walk the floor again with the route doors/shutters in place, so no item lands in a
         // passage that is only open once a route is done.
         grid = WalkGrid.Build(root.transform);
+
+        warnings.Add(BuildAtmosphereLights(Child(root.transform, "Atmosphere Lights"), materials,
+            envObjects.Where(env => env.Kind == EnvKind.Fan).Select(env => env.Bounds).ToList()));
+        warnings.Add(PlaceGrannySpawn());
+        // Under the roof: all reachable floor, and the whole washroom (its back is behind partitions).
+        List<Vector3> underRoof = grid.ReachablePoints().Select(p => p.floor).ToList();
+        for (float x = washroomBounds.min.x; washroomBounds.size.x > 0f && x <= washroomBounds.max.x; x += 0.4f)
+        for (float z = washroomBounds.min.z; z <= washroomBounds.max.z; z += 0.4f)
+            underRoof.Add(new Vector3(x, 0f, z));
+        int patched = FloorPolish.PatchRoofOver(underRoof, 0.6f);
+        warnings.Add($"Roof patches: {patched} m² of reachable floor had no roof above and got a ceiling.");
 
         janitorWarning = null;
         int spotCount = BuildSpawnPoints(Child(root.transform, "Spawn Points"), root.transform);
@@ -254,7 +295,7 @@ public static class RouteSceneBuilder
         managerObject.AddComponent<NetworkObject>();
         RouteManager manager = managerObject.AddComponent<RouteManager>();
         manager.Configure(BuildItemRules(), pickups.Select(pair => new PickupPrefabEntry { itemId = pair.Key, prefab = pair.Value }).ToArray(),
-            pcs, 3, ItemIds.R3JanitorKey, benchCandidates.ToArray());
+            pcs, 3, ItemIds.R3JanitorKey, benchCandidates.ToArray(), cabinetCandidates.ToArray());
 
         EnvSpot[] envSpots = envObjects
             .Where(env => !env.UsedByPc)
@@ -291,22 +332,39 @@ public static class RouteSceneBuilder
 
     // ------------------------------------------------------------------ routes
 
-    private static void BuildLocksmith(Transform parent, Materials materials, List<string> warnings)
+    private static void BuildLocksmith(Transform parent, Materials materials, List<string> warnings, List<Bounds> envWindows)
     {
         const string route = "Locksmith";
 
-        RouteInteractable cabinet = NewStep(parent, "R1_KeyCabinet", KeyCabinetSpot, warnings);
-        GameObject cabinetVisual = AddModel(cabinet.transform, "Route01_Locksmith", "R1_KeyCabinet",
-            () => Box("Cabinet", new Vector3(0.6f, 0.75f, 0.2f), new Vector3(0f, 1.2f, 0f), materials.Metal));
-        cabinet.Configure("R1_KeyCabinet", route, "Key Cabinet", "Smash", 3f, 1, false, NoiseLevel.Loud, NoiseLevel.None,
-            null, Items((ItemIds.Hammer, 1)), null, Items((ItemIds.R1DoorKey, 1)));
-        // The model carries both the intact glass and the shards; show the shards only once smashed.
-        GameObject[] shards = FindChildren(cabinetVisual.transform, "GlassShards");
-        GameObject[] glass = FindChildren(cabinetVisual.transform, "Glass").Except(shards).ToArray();
-        foreach (GameObject shard in shards)
-            shard.SetActive(false);
-        cabinet.ConfigureVisuals(shards, glass, null, new[] { Glow(cabinet.transform, new Vector3(0f, 1.2f, -0.15f), materials) }, null);
-        EnsureCollider(cabinetVisual);
+        // The key cabinet hangs on a plain wall (no window, no door, nothing in front), one spot per
+        // room; the round picks one of them.
+        cabinetCandidates.Clear();
+        List<(Vector3 floor, Vector3 wallward, string room)> wallSpots = FindCabinetWallSpots(envWindows);
+        if (wallSpots.Count == 0)
+        {
+            warnings.Add("No plain wall found for the key cabinet; it stands at the fallback spot.");
+            wallSpots.Add((SnapToFloor(KeyCabinetSpot, "R1_KeyCabinet", warnings), Vector3.forward, null));
+        }
+
+        for (int index = 0; index < wallSpots.Count; index++)
+        {
+            (Vector3 floor, Vector3 wallward, string room) = wallSpots[index];
+            RouteInteractable cabinet = NewStep(parent, $"R1_KeyCabinet_{index + 1}", floor, warnings, snap: false);
+            GameObject cabinetVisual = AddModel(cabinet.transform, "Route01_Locksmith", "R1_KeyCabinet",
+                () => Box("Cabinet", new Vector3(0.46f, 0.6f, 0.12f), new Vector3(0f, 0.3f, 0.06f), materials.Metal));
+            HangOnWall(cabinet.transform, cabinetVisual, "Glass", floor, wallward, 1.1f);
+            cabinet.Configure($"R1_KeyCabinet_{index + 1}", route, "Key Cabinet", "Smash", 3f, 1, false, NoiseLevel.Loud, NoiseLevel.None,
+                null, Items((ItemIds.Hammer, 1)), null, Items((ItemIds.R1DoorKey, 1)));
+            // The model carries both the intact glass and the shards; show the shards only once smashed.
+            GameObject[] shards = FindChildren(cabinetVisual.transform, "GlassShards");
+            GameObject[] glass = FindChildren(cabinetVisual.transform, "Glass").Except(shards).ToArray();
+            foreach (GameObject shard in shards)
+                shard.SetActive(false);
+            cabinet.ConfigureVisuals(shards, glass, null, null, null);
+            EnsureCollider(cabinetVisual);
+            cabinetCandidates.Add(cabinet);
+            warnings.Add($"Key cabinet spot {index + 1}: {room ?? "corridor"} wall at ({floor.x:0.0}, {floor.z:0.0}).");
+        }
 
         RouteInteractable tv = NewStep(parent, "R1_TV", TvSpot, warnings);
         GameObject tvVisual = AddModel(tv.transform, "Route01_Locksmith", "R1_TV", () =>
@@ -425,8 +483,13 @@ public static class RouteSceneBuilder
             // Square to the desk: screen faces the desk's room side (the long edge next to reachable
             // floor), computer pushed to the back edge and centred along the desk.
             Vector3 across = Vector3.Cross(Vector3.up, deskTop.Along).normalized;
-            float frontDistance = ReachDistance(deskTop.Center + across * (deskTop.HalfShort + 0.5f));
-            float backDistance = ReachDistance(deskTop.Center - across * (deskTop.HalfShort + 0.5f));
+            // A wall right behind a side rules it out (the screen would face the wall).
+            float SideScore(Vector3 direction) =>
+                ReachDistance(deskTop.Center + direction * (deskTop.HalfShort + 0.5f)) +
+                (Physics.Raycast(new Vector3(deskTop.Center.x, deskTop.Center.y + 0.5f, deskTop.Center.z), direction, deskTop.HalfShort + 0.6f,
+                    Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore) ? 10f : 0f);
+            float frontDistance = SideScore(across);
+            float backDistance = SideScore(-across);
             Vector3 facing = frontDistance <= backDistance ? across : -across;
             Quaternion rotation = Quaternion.Euler(0f, Vector3.SignedAngle(Flat(screenNormal), facing, Vector3.up), 0f);
 
@@ -502,29 +565,25 @@ public static class RouteSceneBuilder
 
             Physics.SyncTransforms();
             int mask = 1 << probeLayer;
-            float nearestRail = float.MaxValue;
-            foreach (float height in new[] { 0.5f, 0.7f, 0.9f, 1.0f })
-            foreach (float side in new[] { -0.4f, -0.2f, 0f, 0.2f, 0.4f })
+            // The railing is a thin pipe on posts (rays at fixed heights slip under or over it):
+            // walk outward and scan each slice from head height down for the first solid point.
+            bool railFound = false;
+            for (float d = 0.1f; d <= 1.6f && !railFound; d += 0.03f)
             {
-                Vector3 from = floor + Vector3.up * height + Vector3.Cross(Vector3.up, outward) * side;
-                if (Physics.Raycast(from, outward, out RaycastHit rail, 3f, mask, QueryTriggerInteraction.Ignore) && rail.distance < nearestRail)
-                    nearestRail = rail.distance;
-            }
-
-            if (nearestRail < float.MaxValue)
-            {
-                railDistance = nearestRail;
                 for (float y = 1.6f; y >= 0.3f; y -= 0.02f)
                 {
-                    // Highest point of the railing just in front of the spot.
-                    if (Physics.CheckBox(floor + outward * (railDistance + 0.04f) + Vector3.up * y, new Vector3(0.6f, 0.01f, 0.06f),
+                    if (!Physics.CheckBox(floor + outward * d + Vector3.up * y, new Vector3(0.6f, 0.01f, 0.015f),
                             Quaternion.LookRotation(outward), mask, QueryTriggerInteraction.Ignore))
-                    {
-                        railTop = y;
-                        break;
-                    }
+                        continue;
+                    railDistance = d;
+                    railTop = y + 0.01f;
+                    railFound = true;
+                    break;
                 }
             }
+
+            if (!railFound)
+                warnings.Add("R3_Ladder: no railing found in front of the spot; assumed 1.0 m high.");
 
             for (float d = 0.1f; d <= 3f; d += 0.04f)
             {
@@ -542,7 +601,27 @@ public static class RouteSceneBuilder
             float hang = Mathf.Max(edgeDistance, railDistance) + 0.06f;
             ladderModel.transform.position = floor + outward * hang + Vector3.up * railTop;
             exitPoint = floor + outward * hang;
-            warnings.Add($"R3_Ladder: railing {railDistance:0.00} m out (top {railTop:0.00} m), slab edge {edgeDistance:0.00} m out.");
+
+            // The model's rails run on well past its origin: drop it so the top of the ladder (every
+            // part but the plank pile) sits just above the railing.
+            Physics.SyncTransforms();
+            float ladderTop = float.MinValue;
+            foreach (Renderer part in ladderModel.GetComponentsInChildren<Renderer>(true))
+            {
+                if (part.GetComponentsInParent<Transform>(true).Any(t => t.name.StartsWith("Base")))
+                    continue;
+                ladderTop = Mathf.Max(ladderTop, part.bounds.max.y);
+            }
+
+            float drop = 0f;
+            if (ladderTop > float.MinValue)
+            {
+                drop = ladderTop - (floor.y + railTop + 0.12f);
+                ladderModel.transform.position -= Vector3.up * drop;
+            }
+
+            warnings.Add($"R3_Ladder: railing {railDistance:0.00} m out (top {railTop:0.00} m), slab edge {edgeDistance:0.00} m out, " +
+                         $"lowered {drop:0.00} m so its top is 0.12 m above the rail.");
 
             for (int stage = 0; stage < 3; stage++)
                 stages[stage] = FindChildren(ladderModel.transform, $"Stage{stage + 1}").FirstOrDefault();
@@ -684,6 +763,127 @@ public static class RouteSceneBuilder
     // ------------------------------------------------------------------ floor-model furniture
 
     private static readonly List<RouteInteractable> benchCandidates = new();
+    private static readonly List<RouteInteractable> cabinetCandidates = new();
+
+    /// <summary>
+    /// Plain wall spots for the key cabinet, at most one per room (rooms near the key's other route
+    /// steps are fine): reachable floor right next to a flat wall that is clear at 1.0-1.8 m over
+    /// 0.8 m of its width, at least 1.5 m from any door and 2 m from any window.
+    /// </summary>
+    private static List<(Vector3 floor, Vector3 wallward, string room)> FindCabinetWallSpots(List<Bounds> windows)
+    {
+        List<(Vector3, Vector3, string)> result = new();
+        if (grid == null)
+            return result;
+
+        List<Vector3> doors = new();
+        foreach (NetworkLockedDoor door in Object.FindObjectsByType<NetworkLockedDoor>(FindObjectsInactive.Exclude))
+        {
+            if (door.TryGetEditorLeafBounds(out Bounds leaf, out _))
+                doors.Add(leaf.center);
+        }
+
+        Dictionary<string, (Vector3 floor, Vector3 wallward, float score)> best = new();
+        foreach ((Vector3 floor, int open) in grid.ReachablePoints())
+        {
+            string room = RoomAt(floor);
+            if (room == null || room == JanitorRoom || room == "Washroom" || doors.Any(d => (Flat(d) - Flat(floor)).magnitude < 2.2f))
+                continue;
+
+            foreach (Vector3 direction in new[] { Vector3.forward, Vector3.back, Vector3.left, Vector3.right })
+            {
+                Vector3 along = Vector3.Cross(Vector3.up, direction);
+                float wall = -1f;
+                bool flat = true;
+                foreach (float height in new[] { 1.0f, 1.4f, 1.8f })
+                foreach (float side in new[] { -0.4f, 0f, 0.4f })
+                {
+                    Vector3 from = floor + Vector3.up * height + along * side;
+                    if (!Physics.Raycast(from, direction, out RaycastHit hit, 0.9f, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore) ||
+                        Vector3.Dot(hit.normal, -direction) < 0.95f || hit.collider.name.ToLowerInvariant().Contains("window") ||
+                        hit.collider.name.ToLowerInvariant().Contains("glass") || hit.collider.name.ToLowerInvariant().Contains("door"))
+                    {
+                        flat = false;
+                        break;
+                    }
+
+                    if (wall < 0f)
+                        wall = hit.distance;
+                    else if (Mathf.Abs(hit.distance - wall) > 0.04f)
+                        flat = false;
+                    if (!flat)
+                        break;
+                }
+
+                if (!flat || wall < 0f)
+                    continue;
+                Vector3 onWall = floor + direction * wall;
+                if (OnWallFixture(onWall, direction))
+                    continue;
+                if (windows.Any(w => Vector2.Distance(new Vector2(w.center.x, w.center.z), new Vector2(onWall.x, onWall.z)) <
+                                     Mathf.Max(w.extents.x, w.extents.z) + 2f))
+                    continue;
+
+                // Prefer spots in the middle of a wall run and near the room's middle.
+                float score = open - (Flat(onWall) - Flat(RoomCenter(room))).magnitude * 0.2f;
+                if (!best.TryGetValue(room, out var held) || score > held.score)
+                    best[room] = (onWall, direction, score);
+            }
+        }
+
+        foreach (KeyValuePair<string, (Vector3 floor, Vector3 wallward, float score)> pair in best.OrderBy(p => p.Key))
+            result.Add((pair.Value.floor, pair.Value.wallward, pair.Key));
+        return result;
+    }
+
+    /// <summary>
+    /// Is anything other than the wall itself (a board, a TV, a notice board, a switchboard, a
+    /// barricade) hanging on the wall within 1.2 m of this spot, between knee and head height?
+    /// Walls and room shells run floor to ceiling; boards, TVs and the like do not, so anything
+    /// shorter than 2.6 m reaching into the strip in front of the wall counts.
+    /// </summary>
+    private static bool OnWallFixture(Vector3 onWall, Vector3 wallward)
+    {
+        Vector3 along = Abs(Vector3.Cross(Vector3.up, wallward));
+        Bounds strip = new(onWall - wallward * 0.2f + Vector3.up * 1.6f, along * 2.4f + Vector3.up * 1.3f + Abs(wallward) * 0.4f);
+        if ((Flat(TvSpot) - Flat(onWall)).magnitude < 2.5f)
+            return true;
+        foreach (Renderer renderer in Object.FindObjectsByType<Renderer>(FindObjectsInactive.Exclude))
+        {
+            Bounds b = renderer.bounds;
+            if (!b.Intersects(strip) || b.size.y > 2.6f || renderer.GetComponentInParent<RouteInteractable>() != null &&
+                renderer.GetComponentInParent<RouteInteractable>().name.StartsWith("R1_KeyCabinet"))
+                continue;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static Vector3 RoomCenter(string name) => Rooms.First(r => r.Name == name).Center;
+
+    /// <summary>
+    /// Turns <paramref name="model"/> so its <paramref name="frontPart"/> faces away from the wall,
+    /// its back against the wall at <paramref name="onWall"/> and its bottom at <paramref name="bottom"/> m.
+    /// </summary>
+    private static void HangOnWall(Transform step, GameObject model, string frontPart, Vector3 onWall, Vector3 wallward, float bottom)
+    {
+        step.SetPositionAndRotation(onWall, Quaternion.identity);
+        Physics.SyncTransforms();
+        Bounds all = RendererBounds(model, onWall);
+        GameObject front = FindChildren(model.transform, frontPart).FirstOrDefault();
+        Vector3 localFront = front != null ? Flat(RendererBounds(front, all.center).center - all.center) : Vector3.back;
+        if (localFront.sqrMagnitude < 0.0001f)
+            localFront = Vector3.back;
+        Vector3 axis = Mathf.Abs(localFront.x) > Mathf.Abs(localFront.z) ? new Vector3(Mathf.Sign(localFront.x), 0f, 0f) : new Vector3(0f, 0f, Mathf.Sign(localFront.z));
+        step.rotation = Quaternion.Euler(0f, Vector3.SignedAngle(axis, -wallward, Vector3.up), 0f);
+        Physics.SyncTransforms();
+        all = RendererBounds(model, onWall);
+        float backReach = Vector3.Dot(all.center - onWall, wallward) + Vector3.Dot(all.extents, Abs(wallward));
+        step.position += -wallward * (backReach + 0.01f) + Vector3.up * (bottom + onWall.y - all.min.y);
+    }
+
+    private static Vector3 Abs(Vector3 v) => new(Mathf.Abs(v.x), Mathf.Abs(v.y), Mathf.Abs(v.z));
 
     /// <summary>
     /// Classroom daises (long low platforms: "Teacher Supremacy" and similar 0.15-0.4 m slabs about
@@ -1799,6 +1999,332 @@ public static class RouteSceneBuilder
         return null;
     }
 
+    /// <summary>
+    /// Dim, uneven lighting: warm lamps along the corridors and cold tubes in the rooms, some dead,
+    /// some flickering (LightFlicker). Seeded, so a rebuild gives the same layout.
+    /// </summary>
+    private static string BuildAtmosphereLights(Transform parent, Materials materials, List<Bounds> fans)
+    {
+        System.Random random = new(1913);
+        List<Vector3> placed = new();
+        int corridor = 0, rooms = 0, flicker = 0, dead = 0, shadowed = 0;
+
+        // Start above desks and shelves, so a lamp never hangs from a piece of furniture; anything
+        // lower than 2.8 m (a fan) is not the ceiling.
+        float CeilingAbove(Vector3 floor) =>
+            Physics.Raycast(floor + Vector3.up * 2.8f, Vector3.up, out RaycastHit hit, 1.0f, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore)
+                ? hit.point.y
+                : floor.y + 3f;
+        bool NearFan(Vector3 floor) => fans.Any(f => (Flat(f.center) - Flat(floor)).magnitude < Mathf.Max(f.extents.x, f.extents.z) + 0.7f);
+
+        // Point lights shine through walls: a lamp whose reach crosses into another room (or out of
+        // its own into the corridor) casts shadows, so its light stops at the wall.
+        bool Leaks(Vector3 position, float range)
+        {
+            string own = RoomAt(position);
+            foreach (RoomSpec room in Rooms)
+            {
+                float dx = Mathf.Max(room.MinX - position.x, 0f, position.x - room.MaxX);
+                float dz = Mathf.Max(room.MinZ - position.z, 0f, position.z - room.MaxZ);
+                bool inside = dx == 0f && dz == 0f;
+                if (room.Name == own)
+                {
+                    float edge = Mathf.Min(position.x - room.MinX, room.MaxX - position.x, position.z - room.MinZ, room.MaxZ - position.z);
+                    if (edge < range * 0.6f)
+                        return true;
+                }
+                else if (!inside && dx * dx + dz * dz < range * range * 0.36f)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        void Lamp(string name, Vector3 floor, Color color, float intensity, float range, bool tube)
+        {
+            float ceiling = CeilingAbove(floor);
+            bool isDead = random.NextDouble() < (tube ? 0.3 : 0.12);
+            bool flickers = !isDead && random.NextDouble() < 0.5;
+
+            GameObject fixture = Box(name, tube ? new Vector3(1.2f, 0.05f, 0.16f) : new Vector3(0.45f, 0.06f, 0.45f),
+                Vector3.zero, isDead ? materials.LampOff : tube ? materials.LampCold : materials.LampWarm);
+            fixture.transform.SetParent(parent, false);
+            fixture.transform.position = new Vector3(floor.x, ceiling - 0.03f, floor.z);
+            Object.DestroyImmediate(fixture.GetComponent<Collider>());
+            if (isDead)
+            {
+                dead++;
+                return;
+            }
+
+            GameObject lightObject = new(name + " Light");
+            lightObject.transform.SetParent(parent, false);
+            lightObject.transform.position = fixture.transform.position + Vector3.down * 0.25f;
+            Light light = lightObject.AddComponent<Light>();
+            light.type = LightType.Point;
+            light.color = color;
+            light.intensity = intensity;
+            light.range = range;
+            bool leaks = Leaks(lightObject.transform.position, range);
+            light.shadows = leaks ? LightShadows.Soft : LightShadows.None;
+            light.shadowResolution = LightShadowResolution.Low;
+            light.shadowNearPlane = 0.2f;
+            if (leaks)
+                shadowed++;
+
+            // Every lamp buzzes a little and drops out now and then; the failing ones a lot more.
+            Color emission = (tube ? materials.LampCold : materials.LampWarm).GetColor("_EmissionColor");
+            LightFlicker flick = lightObject.AddComponent<LightFlicker>();
+            if (flickers)
+            {
+                flick.Configure(fixture.GetComponent<Renderer>(), emission, 0.2f, 4f + (float)random.NextDouble() * 6f);
+                flicker++;
+            }
+            else
+            {
+                flick.Configure(fixture.GetComponent<Renderer>(), emission, 0.05f, 10f + (float)random.NextDouble() * 15f);
+            }
+        }
+
+        // Rooms: one tube in the middle of the part of the room players can reach (never a corridor
+        // cell next to a room that cannot be entered).
+        List<(Vector3 floor, int open)> reachablePoints = grid?.ReachablePoints() ?? new List<(Vector3 floor, int open)>();
+        foreach (RoomSpec room in Rooms)
+        {
+            List<Vector3> inRoom = reachablePoints.Select(p => p.floor).Where(p => RoomAt(p) == room.Name).ToList();
+            if (inRoom.Count < 8)
+                continue;
+            Vector3 middle = new(inRoom.Average(p => p.x), 0f, inRoom.Average(p => p.z));
+            List<Vector3> clear = inRoom.Where(p => !NearFan(p)).ToList();
+            Vector3 floor = (clear.Count > 0 ? clear : inRoom).OrderBy(p => (Flat(p) - middle).sqrMagnitude).First();
+            Lamp($"Room Lamp - {room.Name}", floor, new Color(0.72f, 0.85f, 1f), 1.4f, 7f, true);
+            placed.Add(floor);
+            rooms++;
+        }
+
+        // Corridors: corridor middles first, spaced out.
+        if (grid != null)
+        {
+            foreach ((Vector3 floor, int open) in reachablePoints.OrderByDescending(p => p.open).ThenBy(p => p.floor.x).ThenBy(p => p.floor.z))
+            {
+                if (RoomAt(floor) != null || NearFan(floor) || placed.Any(p => (Flat(p) - Flat(floor)).sqrMagnitude < 7.5f * 7.5f))
+                    continue;
+                Lamp($"Corridor Lamp {corridor + 1}", floor, new Color(1f, 0.74f, 0.45f), 1.7f, 6.5f, false);
+                placed.Add(floor);
+                corridor++;
+            }
+        }
+
+        return $"Atmosphere lights: {corridor} corridor lamps, {rooms} room tubes, {dead} dead, {flicker} failing, " +
+               $"the rest with rare dropouts; {shadowed} cast shadows so they do not light through walls.";
+    }
+
+    // ------------------------------------------------------------------ closing the floor: washroom, glass, crouch gaps
+
+    // The washroom from the team's full floor model (Assets/Routes/Shared/Models/Washroom.fbx,
+    // exported by Tools/Blender/export_washroom.py) sits flush with the Blackout shutter exit, its
+    // open side onto the corridor; the corridor ends at x -32. The walkable strip further west
+    // (collision floor, nothing modelled) is outside, behind the classroom windows: closed off.
+    private const string WashroomModelPath = RoutesRoot + "/Shared/Models/Washroom.fbx";
+    private const float WashroomEastX = -24.3f;      // against the stair-passage wall beside the shutter
+    private const float WashroomNorthZ = -9.8f;      // the corridor's south edge
+    private const float CorridorEndX = -32.67f;     // Classroom 06's east wall face (Plane.036)
+    private const float ClassroomSouthCornerZ = -7.9f; // where Classroom 06's walls end to the south
+    private static readonly Rect OutsideStrip = Rect.MinMaxRect(-56f, -13.6f, CorridorEndX, -7.95f);
+    private const float WallHeight = 3.0f;
+
+    private static Bounds washroomBounds;
+
+    private static string BuildWashroom(Transform parent, Materials materials)
+    {
+        washroomBounds = default;
+        GameObject root = Child(parent, "Washroom").gameObject;
+        GameObject asset = AssetDatabase.LoadAssetAtPath<GameObject>(WashroomModelPath);
+        if (asset == null)
+            return $"Washroom: {WashroomModelPath} missing (run Tools/Blender/export_washroom.py); nothing built.";
+
+        GameObject model = (GameObject)PrefabUtility.InstantiatePrefab(asset);
+        model.transform.SetParent(root.transform, false);
+
+        // Turn it so the back wall (Cube.172) is to the south and the toilet-cubicle wall
+        // (Cube.177) to the east: then the open side faces the corridor.
+        Transform back = FindChildren(model.transform, "Cube.172").FirstOrDefault()?.transform;
+        Transform side = FindChildren(model.transform, "Cube.177").FirstOrDefault()?.transform;
+        float bestScore = float.NegativeInfinity;
+        float bestYaw = 0f;
+        foreach (float yaw in new[] { 0f, 90f, 180f, 270f })
+        {
+            model.transform.localRotation = Quaternion.Euler(0f, yaw, 0f);
+            Physics.SyncTransforms();
+            Vector3 centre = RendererBounds(model, Vector3.zero).center;
+            float score = 0f;
+            if (back != null)
+                score -= RendererBounds(back.gameObject, centre).center.z - centre.z;
+            if (side != null)
+                score += RendererBounds(side.gameObject, centre).center.x - centre.x;
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestYaw = yaw;
+            }
+        }
+
+        model.transform.localRotation = Quaternion.Euler(0f, bestYaw, 0f);
+        Physics.SyncTransforms();
+        Bounds bounds = RendererBounds(model, Vector3.zero);
+        // The export has its floor at 0 (walls start 0.2 m below it).
+        model.transform.position += new Vector3(WashroomEastX - bounds.max.x, 0f, WashroomNorthZ - bounds.max.z);
+        Physics.SyncTransforms();
+        bounds = RendererBounds(model, Vector3.zero);
+        washroomBounds = bounds;
+
+        // Collision: walls, toilets, basins and urinals; mirrors, soap dispensers, the air
+        // extractor and the cubicle doors stay non-solid (the doors swing in the model only).
+        int solid = 0;
+        foreach (MeshFilter filter in model.GetComponentsInChildren<MeshFilter>(true))
+        {
+            string name = filter.gameObject.name.ToLowerInvariant();
+            // Counters (Cube.345/346) and basins: the room is too tight for the player's capsule with them solid.
+            if (name.Contains("mirror") || name.Contains("circle") || name.Contains("air") || name.Contains("cylinder") ||
+                name.Contains("basin") || name == "cube.345" || name == "cube.346")
+                continue;
+            filter.gameObject.AddComponent<MeshCollider>().sharedMesh = filter.sharedMesh;
+            solid++;
+        }
+
+        GameObjectUtility.SetStaticEditorFlags(model, StaticEditorFlags.BatchingStatic);
+
+        // Floor under it (nothing to walk on there before).
+        Rect area = Rect.MinMaxRect(bounds.min.x, bounds.min.z, bounds.max.x, WashroomNorthZ);
+        GameObject floor = Box("Washroom Floor", new Vector3(area.width, 0.1f, area.height), Vector3.zero, materials.WashroomFloor);
+        floor.transform.SetParent(root.transform, false);
+        floor.transform.position = new Vector3(area.center.x, -0.048f, area.center.y);
+
+        // A ceiling of its own, overlapping the wall tops: the corridor roof left a thin line of sky
+        // along the washroom's walls. Its underside sits just below the roof (y 3.02).
+        GameObject ceiling = Box("Washroom Ceiling", new Vector3(bounds.size.x + 0.4f, 0.08f, bounds.size.z + 0.4f), Vector3.zero, materials.WashroomWall);
+        ceiling.transform.SetParent(root.transform, false);
+        ceiling.transform.position = new Vector3(bounds.center.x, 3.0f + 0.04f, bounds.center.z);
+        Object.DestroyImmediate(ceiling.GetComponent<Collider>());
+
+        // The corridor ends at Classroom 06's east wall face: a wall from the classroom's south
+        // corner to the washroom, flush with the classroom wall (not standing in front of it).
+        const float endTop = ClassroomSouthCornerZ + 0.05f, endBottom = WashroomNorthZ - 0.2f;
+        GameObject end = Box("Corridor End Wall", new Vector3(0.25f, WallHeight, endTop - endBottom), Vector3.zero, materials.WashroomWall);
+        end.transform.SetParent(root.transform, false);
+        end.transform.position = new Vector3(CorridorEndX - 0.125f, WallHeight * 0.5f, (endTop + endBottom) * 0.5f);
+        // The washroom's west wall stands east of that line: a short piece along the washroom's
+        // north edge closes the gap between the two.
+        float fillEast = bounds.min.x + 0.2f;
+        GameObject fill = Box("Corridor End Filler", new Vector3(fillEast - (CorridorEndX - 0.25f), WallHeight, 0.2f), Vector3.zero, materials.WashroomWall);
+        fill.transform.SetParent(root.transform, false);
+        fill.transform.position = new Vector3((fillEast + CorridorEndX - 0.25f) * 0.5f, WallHeight * 0.5f, WashroomNorthZ - 0.1f);
+
+        // Outside the classroom windows: no floor, so the collision floor there is closed off.
+        GameObject outside = new("Outside Strip Blocker");
+        outside.transform.SetParent(root.transform, false);
+        outside.transform.position = new Vector3(OutsideStrip.center.x, 1.5f, OutsideStrip.center.y);
+        outside.AddComponent<BoxCollider>().size = new Vector3(OutsideStrip.width, 3f, OutsideStrip.height);
+
+        return $"Washroom: model from the floor file, turned {bestYaw:0}°, x {bounds.min.x:0.0}..{bounds.max.x:0.0}, z {bounds.min.z:0.0}..{bounds.max.z:0.0}, " +
+               $"{solid} solid parts; corridor ends at x {CorridorEndX}; strip outside the classroom windows closed off.";
+    }
+
+    // The hall beside the lift has no north wall: a frosted glass front closes it and shows the fog outside.
+    private static readonly Vector3 LiftHallProbe = new(-23.4f, 0f, 22f);
+
+    private static string BuildLiftHallGlass(Transform parent, Materials materials)
+    {
+        static bool FloorAt(Vector3 xz) => Physics.Raycast(new Vector3(xz.x, 1f, xz.z), Vector3.down, out RaycastHit hit, 1.4f,
+            Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore) && Mathf.Abs(hit.point.y) < 0.3f;
+
+        // North edge of the hall's floor.
+        float edge = LiftHallProbe.z;
+        while (edge < LiftHallProbe.z + 8f && FloorAt(new Vector3(LiftHallProbe.x, 0f, edge + 0.05f)))
+            edge += 0.05f;
+        // Along the edge to each side, as far as there is floor and no wall at body height.
+        float Side(float direction)
+        {
+            float x = LiftHallProbe.x;
+            while (Mathf.Abs(x - LiftHallProbe.x) < 12f)
+            {
+                Vector3 next = new(x + direction * 0.05f, 1.5f, edge - 0.3f);
+                if (!FloorAt(next) || Physics.CheckSphere(next, 0.04f, Physics.DefaultRaycastLayers, QueryTriggerInteraction.Ignore))
+                    break;
+                x += direction * 0.05f;
+            }
+
+            return x + direction * 0.1f;   // into the side wall a little, no seam
+        }
+
+        float west = Side(-1f), east = Side(1f);
+
+        GameObject root = Child(parent, "Lift Hall Glass").gameObject;
+        float z = edge - 0.04f;
+        float width = east - west;
+        GameObject pane = Box("Frosted Glass", new Vector3(width, WallHeight, 0.05f), Vector3.zero, materials.FrostedGlass);
+        pane.transform.SetParent(root.transform, false);
+        pane.transform.position = new Vector3((west + east) * 0.5f, WallHeight * 0.5f, z);
+        pane.GetComponent<Renderer>().shadowCastingMode = ShadowCastingMode.Off;
+
+        // Frame: sill, head and mullions about every 2.2 m.
+        void Bar(string name, Vector3 size, Vector3 position)
+        {
+            GameObject bar = Box(name, size, Vector3.zero, materials.DarkMetal);
+            bar.transform.SetParent(root.transform, false);
+            bar.transform.position = position;
+        }
+
+        Bar("Glass Sill", new Vector3(width, 0.12f, 0.14f), new Vector3((west + east) * 0.5f, 0.06f, z));
+        Bar("Glass Head", new Vector3(width, 0.1f, 0.12f), new Vector3((west + east) * 0.5f, WallHeight - 0.05f, z));
+        int bays = Mathf.Max(1, Mathf.RoundToInt(width / 2.2f));
+        for (int i = 0; i <= bays; i++)
+            Bar($"Mullion {i}", new Vector3(0.08f, WallHeight, 0.12f), new Vector3(west + width * i / bays, WallHeight * 0.5f, z));
+        return $"Lift hall glass: x {west:0.0}..{east:0.0} at z {z:0.00}, {bays} bays.";
+    }
+
+    // Crouch holes (CrouchHoles.Cut): low openings through room walls that only the crouching Runner
+    // fits through, a second way out of a room so the Runner can slip away while Granny goes round.
+    private static readonly (string name, Vector3 near, Vector3 into)[] CrouchHoleSpots =
+    {
+        ("Crouch Hole (Laboratory north wall, east)", new Vector3(-3.0f, 0f, 3.0f), Vector3.forward),
+        ("Crouch Hole (Laboratory north wall, west)", new Vector3(-9.0f, 0f, 3.0f), Vector3.forward),
+    };
+
+    private const string GrannySpawnRoom = "Staff Room";
+
+    /// <summary>
+    /// Granny starts in the Staff Room: an open, reachable spot near its middle, clear of the key
+    /// cabinet, facing the middle of the room.
+    /// </summary>
+    private static string PlaceGrannySpawn()
+    {
+        GameObject marker = GameObject.Find("Granny Spawn Marker");
+        if (marker == null || grid == null)
+            return "Granny spawn: marker or walk grid missing, left where it was.";
+
+        RoomSpec room = Rooms.First(r => r.Name == GrannySpawnRoom);
+        Vector3 middle = Flat(room.Center);
+        List<(Vector3 floor, int open)> candidates = grid.ReachablePoints()
+            .Where(p => RoomAt(p.floor) == GrannySpawnRoom &&
+                        cabinetCandidates.All(c => c == null || (Flat(p.floor) - Flat(c.transform.position)).magnitude > 2.5f))
+            .ToList();
+        if (candidates.Count == 0)
+            return $"Granny spawn: no reachable spot in the {GrannySpawnRoom}, left where it was.";
+
+        int bestOpen = candidates.Max(p => p.open);
+        Vector3 spot = candidates.Where(p => p.open >= bestOpen * 0.85f)
+            .OrderBy(p => (Flat(p.floor) - middle).sqrMagnitude).First().floor;
+        Vector3 look = middle - Flat(spot);
+        marker.transform.position = spot + Vector3.up * 0.51f;   // same height above the floor as before
+        if (look.sqrMagnitude > 0.01f)
+            marker.transform.rotation = Quaternion.LookRotation(look.normalized, Vector3.up);
+        EditorUtility.SetDirty(marker.transform);
+        return $"Granny spawn: {GrannySpawnRoom} at ({spot.x:0.0}, {spot.z:0.0}).";
+    }
+
     private static Bounds FloorBounds(Transform contentRoot)
     {
         Bounds bounds = new(Vector3.zero, Vector3.zero);
@@ -1873,6 +2399,7 @@ public static class RouteSceneBuilder
     private sealed class WalkGrid
     {
         private const float Cell = 0.4f;
+        public const float CellArea = Cell * Cell;
         private const float Radius = 0.28f;
         private Vector3 origin;
         private int countX;
@@ -2381,6 +2908,32 @@ public static class RouteSceneBuilder
             return map.ToString();
         }
 
+        /// <summary>Reachable cells with how many reachable cells lie within 1.2 m (corridor middles score high).</summary>
+        public List<(Vector3 floor, int open)> ReachablePoints()
+        {
+            List<(Vector3, int)> points = new();
+            for (int x = 0; x < countX; x++)
+            for (int z = 0; z < countZ; z++)
+            {
+                int index = x * countZ + z;
+                if (!reachable[index])
+                    continue;
+                int open = 0;
+                for (int dx = -3; dx <= 3; dx++)
+                for (int dz = -3; dz <= 3; dz++)
+                {
+                    int nx = x + dx, nz = z + dz;
+                    if (nx >= 0 && nz >= 0 && nx < countX && nz < countZ && reachable[nx * countZ + nz])
+                        open++;
+                }
+
+                Vector3 center = CellCenter(x, z);
+                points.Add((new Vector3(center.x, floorY[index], center.z), open));
+            }
+
+            return points;
+        }
+
         public bool TryNearestReachable(Vector3 position, float maxDistance, out Vector3 floor)
         {
             floor = default;
@@ -2675,10 +3228,35 @@ public static class RouteSceneBuilder
         public readonly Material Ice = Make("M_Route_Ice", new Color(0.7f, 0.88f, 1f), 0.1f);
         public readonly Material Barricade = Make("M_Route_Barricade", new Color(0.35f, 0.28f, 0.2f), 0.85f);
         public readonly Material Shutter = Make("M_Route_Shutter", new Color(0.45f, 0.48f, 0.5f), 0.45f, 0.7f);
+        public readonly Material WashroomWall = Make("M_Route_WashroomWall", new Color(0.78f, 0.8f, 0.78f), 0.55f);
+        public readonly Material WashroomFloor = Make("M_Route_WashroomFloor", new Color(0.42f, 0.45f, 0.47f), 0.35f);
+        public readonly Material FrostedGlass = MakeGlass("M_Route_FrostedGlass", new Color(0.72f, 0.78f, 0.84f, 0.55f));
         public readonly Material Hazard = Make("M_Route_Hazard", new Color(0.95f, 0.75f, 0.1f), 0.6f, 0f, new Color(0.25f, 0.18f, 0f));
         public readonly Material Screen = Make("M_Route_Screen", new Color(0.15f, 0.5f, 0.9f), 0.2f, 0f, new Color(0.3f, 0.9f, 1.6f));
         public readonly Material AlertGlow = Make("M_Route_AlertGlow", new Color(0.9f, 0.2f, 0.15f), 0.3f, 0f, new Color(1.8f, 0.25f, 0.15f));
+        public readonly Material LampWarm = Make("M_Route_LampWarm", new Color(1f, 0.85f, 0.6f), 0.4f, 0f, new Color(1.6f, 1.05f, 0.55f));
+        public readonly Material LampCold = Make("M_Route_LampCold", new Color(0.85f, 0.92f, 1f), 0.4f, 0f, new Color(0.9f, 1.1f, 1.4f));
+        public readonly Material LampOff = Make("M_Route_LampOff", new Color(0.3f, 0.3f, 0.28f), 0.6f);
         public readonly Material ExitGlow = Make("M_Route_ExitGlow", new Color(0.15f, 0.8f, 0.3f), 0.3f, 0f, new Color(0.2f, 1.6f, 0.4f));
+
+        /// <summary>Frosted, see-through URP Lit (transparent surface, alpha blended).</summary>
+        private static Material MakeGlass(string name, Color color)
+        {
+            Material material = Make(name, color, 0.55f);
+            material.SetFloat("_Surface", 1f);
+            material.SetFloat("_Blend", 0f);
+            material.SetFloat("_SrcBlend", (float)BlendMode.SrcAlpha);
+            material.SetFloat("_DstBlend", (float)BlendMode.OneMinusSrcAlpha);
+            material.SetFloat("_SrcBlendAlpha", (float)BlendMode.One);
+            material.SetFloat("_DstBlendAlpha", (float)BlendMode.OneMinusSrcAlpha);
+            material.SetFloat("_ZWrite", 0f);
+            material.SetFloat("_Cull", (float)CullMode.Off);
+            material.SetOverrideTag("RenderType", "Transparent");
+            material.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
+            material.renderQueue = (int)RenderQueue.Transparent;
+            EditorUtility.SetDirty(material);
+            return material;
+        }
 
         private static Material Make(string name, Color color, float roughness, float metallic = 0f, Color? emission = null)
         {

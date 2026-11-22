@@ -2130,8 +2130,9 @@ public static class RouteSceneBuilder
     private const string WashroomModelPath = RoutesRoot + "/Shared/Models/Washroom.fbx";
     private const float WashroomEastX = -24.3f;      // against the stair-passage wall beside the shutter
     private const float WashroomNorthZ = -9.8f;      // the corridor's south edge
-    private const float CorridorEndX = -32.5f;      // on the line of Classroom 06's east wall
-    private static readonly Rect OutsideStrip = Rect.MinMaxRect(-56f, -13.6f, -32.25f, -7.95f);
+    private const float CorridorEndX = -32.67f;     // Classroom 06's east wall face (Plane.036)
+    private const float ClassroomSouthCornerZ = -7.9f; // where Classroom 06's walls end to the south
+    private static readonly Rect OutsideStrip = Rect.MinMaxRect(-56f, -13.6f, CorridorEndX, -7.95f);
     private const float WallHeight = 3.0f;
 
     private static Bounds washroomBounds;
@@ -2201,11 +2202,25 @@ public static class RouteSceneBuilder
         floor.transform.SetParent(root.transform, false);
         floor.transform.position = new Vector3(area.center.x, -0.048f, area.center.y);
 
-        // The corridor ends at x -32: a wall from the classroom wall to the washroom.
-        const float endTop = -6.6f, endBottom = WashroomNorthZ - 0.4f;
+        // A ceiling of its own, overlapping the wall tops: the corridor roof left a thin line of sky
+        // along the washroom's walls. Its underside sits just below the roof (y 3.02).
+        GameObject ceiling = Box("Washroom Ceiling", new Vector3(bounds.size.x + 0.4f, 0.08f, bounds.size.z + 0.4f), Vector3.zero, materials.WashroomWall);
+        ceiling.transform.SetParent(root.transform, false);
+        ceiling.transform.position = new Vector3(bounds.center.x, 3.0f + 0.04f, bounds.center.z);
+        Object.DestroyImmediate(ceiling.GetComponent<Collider>());
+
+        // The corridor ends at Classroom 06's east wall face: a wall from the classroom's south
+        // corner to the washroom, flush with the classroom wall (not standing in front of it).
+        const float endTop = ClassroomSouthCornerZ + 0.05f, endBottom = WashroomNorthZ - 0.2f;
         GameObject end = Box("Corridor End Wall", new Vector3(0.25f, WallHeight, endTop - endBottom), Vector3.zero, materials.WashroomWall);
         end.transform.SetParent(root.transform, false);
-        end.transform.position = new Vector3(CorridorEndX, WallHeight * 0.5f, (endTop + endBottom) * 0.5f);
+        end.transform.position = new Vector3(CorridorEndX - 0.125f, WallHeight * 0.5f, (endTop + endBottom) * 0.5f);
+        // The washroom's west wall stands east of that line: a short piece along the washroom's
+        // north edge closes the gap between the two.
+        float fillEast = bounds.min.x + 0.2f;
+        GameObject fill = Box("Corridor End Filler", new Vector3(fillEast - (CorridorEndX - 0.25f), WallHeight, 0.2f), Vector3.zero, materials.WashroomWall);
+        fill.transform.SetParent(root.transform, false);
+        fill.transform.position = new Vector3((fillEast + CorridorEndX - 0.25f) * 0.5f, WallHeight * 0.5f, WashroomNorthZ - 0.1f);
 
         // Outside the classroom windows: no floor, so the collision floor there is closed off.
         GameObject outside = new("Outside Strip Blocker");

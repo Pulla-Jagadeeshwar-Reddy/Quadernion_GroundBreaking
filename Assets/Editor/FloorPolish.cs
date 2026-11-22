@@ -663,9 +663,9 @@ public static class FloorPolish
         }
 
         RenderSettings.ambientMode = AmbientMode.Trilight;
-        RenderSettings.ambientSkyColor = new Color(0.10f, 0.11f, 0.16f);
-        RenderSettings.ambientEquatorColor = new Color(0.06f, 0.06f, 0.08f);
-        RenderSettings.ambientGroundColor = new Color(0.03f, 0.03f, 0.035f);
+        RenderSettings.ambientSkyColor = new Color(0.14f, 0.155f, 0.22f);
+        RenderSettings.ambientEquatorColor = new Color(0.085f, 0.085f, 0.11f);
+        RenderSettings.ambientGroundColor = new Color(0.045f, 0.045f, 0.05f);
         RenderSettings.fog = true;
         RenderSettings.fogMode = FogMode.ExponentialSquared;
         RenderSettings.fogDensity = 0.03f;
@@ -677,7 +677,7 @@ public static class FloorPolish
         {
             moon.name = "Moonlight";
             moon.color = new Color(0.55f, 0.63f, 0.85f);
-            moon.intensity = 0.3f;
+            moon.intensity = 0.4f;
             moon.shadows = LightShadows.Soft;
             moon.transform.rotation = Quaternion.Euler(38f, -35f, 0f);
             RenderSettings.sun = moon;

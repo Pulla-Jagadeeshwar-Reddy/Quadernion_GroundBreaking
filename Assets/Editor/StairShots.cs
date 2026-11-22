@@ -180,6 +180,62 @@ public static class StairShots
         Debug.Log($"[StairShots] atmosphere shots written to Logs/atmosphere_shots");
     }
 
+    /// <summary>Debug: four views at each spot where see-through wall slivers were reported, into Logs/gap_shots.</summary>
+    [MenuItem("Tools/Routes/Debug/Render Wall Gap Shots")]
+    public static void RenderGapShots()
+    {
+        EditorSceneManager.OpenScene("Assets/Scenes/OnlineFirstFloor.unity", OpenSceneMode.Single);
+        string folder = Path.Combine(Application.dataPath, "../Logs/gap_shots");
+        Directory.CreateDirectory(folder);
+        GameObject camObject = new("Gap Camera");
+        UnityEngine.Camera cam = camObject.AddComponent<UnityEngine.Camera>();
+        cam.clearFlags = CameraClearFlags.Skybox;
+        cam.fieldOfView = 70f;
+        cam.nearClipPlane = 0.05f;
+        cam.farClipPlane = 120f;
+        RenderTexture target = new(640, 400, 24);
+        cam.targetTexture = target;
+
+        Vector2[] spots = { new(-14f, 14f), new(-10f, 14f), new(-6f, 14f), new(8f, 14f), new(7f, -3f), new(-28f, -13f), new(-26f, -11f) };
+        foreach (Vector2 spot in spots)
+        {
+            Vector3 eye = new(spot.x, 1.6f, spot.y);
+            for (int yaw = 0; yaw < 360; yaw += 90)
+            {
+                camObject.transform.SetPositionAndRotation(eye, Quaternion.Euler(0f, yaw, 0f));
+                Save(cam, target, Path.Combine(folder, $"gap_{spot.x}_{spot.y}_{yaw}.png"));
+                // Looking up at the ceiling edge too.
+                camObject.transform.SetPositionAndRotation(eye, Quaternion.Euler(-40f, yaw, 0f));
+                Save(cam, target, Path.Combine(folder, $"gap_{spot.x}_{spot.y}_{yaw}_up.png"));
+            }
+        }
+
+        // The sealed stairs' boards, seen from the passage leading to them.
+        Shot("stairs_spawn", new Vector3(-10.4f, 1.6f, 17.2f), new Vector3(-10.4f, 1.0f, 23f));
+        Shot("stairs_classroom01", new Vector3(6.4f, 1.6f, 17.5f), new Vector3(6.4f, 1.0f, 23f));
+
+        // Where the corridor-end wall meets the washroom and the classroom wall.
+        Shot("corridor_end_mismatch", new Vector3(-30.5f, 1.6f, -8.2f), new Vector3(-32.3f, 1.4f, -9.6f));
+        Shot("corridor_end_protrude", new Vector3(-30.5f, 1.6f, -4.6f), new Vector3(-33f, 1.4f, -5.8f));
+        cam.orthographic = true;
+        cam.orthographicSize = 4f;
+        cam.clearFlags = CameraClearFlags.SolidColor;
+        cam.backgroundColor = Color.magenta;
+        camObject.transform.SetPositionAndRotation(new Vector3(-32f, 2.9f, -8f), Quaternion.Euler(90f, 0f, 0f));
+        Save(cam, target, Path.Combine(folder, "corridor_end_top.png"));
+        cam.orthographic = false;
+        cam.clearFlags = CameraClearFlags.Skybox;
+
+        void Shot(string name, Vector3 eye, Vector3 look)
+        {
+            camObject.transform.SetPositionAndRotation(eye, Quaternion.LookRotation(look - eye));
+            Save(cam, target, Path.Combine(folder, name + ".png"));
+        }
+
+        Object.DestroyImmediate(camObject);
+        Debug.Log("[StairShots] wall gap shots written to Logs/gap_shots");
+    }
+
     private static void Save(UnityEngine.Camera cam, RenderTexture target, string path)
     {
         cam.Render();
